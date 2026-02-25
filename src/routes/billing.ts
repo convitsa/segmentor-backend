@@ -149,11 +149,11 @@ billing.post("/webhook", async (c) => {
     return c.json({ error: "Missing stripe-signature header" }, 400);
   }
 
-  const rawBody = await c.req.text();
+  const rawBody = await c.req.raw.text();
 
   let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(rawBody, signature, STRIPE_WEBHOOK_SECRET);
+    event = await stripe.webhooks.constructEventAsync(rawBody, signature, STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error("Webhook signature verification failed:", err);
     return c.json({ error: "Invalid signature" }, 400);
