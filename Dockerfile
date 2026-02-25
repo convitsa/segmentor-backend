@@ -57,7 +57,7 @@ ENV RESEND_API_KEY=${RESEND_API_KEY}
 ENV EMAIL_FROM=${EMAIL_FROM}
 ENV POSTHOG_API_KEY=${POSTHOG_API_KEY}
 
-# Build the Next.js application
+RUN bunx prisma generate
 RUN bun run build
 
 # Copy NGINX configuration

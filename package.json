@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "bun run --watch src/index.ts",
-    "start": "bun run src/index.ts",
+    "build": "bun build src/index.ts --target=bun --outdir=dist --sourcemap",
+    "start": "bun run dist/index.js",
     "db:push": "bunx prisma db push",
     "db:generate": "bunx prisma generate",
     "db:studio": "bunx prisma studio",
