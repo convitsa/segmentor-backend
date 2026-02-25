@@ -117,18 +117,35 @@ pub.get("/project-config", async (c) => {
 });
 
 pub.get("/geo", async (c) => {
-  const forwarded = c.req.header("x-forwarded-for");
-  const ip = forwarded ? forwarded.split(",")[0].trim() : c.req.header("x-real-ip") || "127.0.0.1";
+  const clientIp =
+    c.req.header("x-client-ip") ||
+    c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
+    c.req.header("x-real-ip") ||
+    "";
 
-  const isLocal = ip === "127.0.0.1" || ip === "::1" || ip.startsWith("192.168.") || ip.startsWith("10.");
-  const lookupIp = isLocal ? "" : ip;
+  const isPrivate =
+    !clientIp ||
+    clientIp === "127.0.0.1" ||
+    clientIp === "::1" ||
+    clientIp.startsWith("192.168.") ||
+    clientIp.startsWith("10.") ||
+    (clientIp.startsWith("172.") && (() => {
+      const second = parseInt(clientIp.split(".")[1], 10);
+      return second >= 16 && second <= 31;
+    })());
+
+  const empty = { country: "", countryCode: "", region: "", city: "" };
 
   try {
-    const res = await fetch(`http://ip-api.com/json/${lookupIp}?fields=status,country,countryCode,regionName,city`);
+    const lookupUrl = isPrivate
+      ? "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city"
+      : `http://ip-api.com/json/${clientIp}?fields=status,country,countryCode,regionName,city`;
+
+    const res = await fetch(lookupUrl);
     const data = await res.json() as Record<string, string>;
 
     if (data.status !== "success") {
-      return c.json({ country: "", countryCode: "", region: "", city: "" });
+      return c.json(empty);
     }
 
     c.header("Cache-Control", "public, max-age=300");
@@ -139,7 +156,7 @@ pub.get("/geo", async (c) => {
       city: data.city || "",
     });
   } catch {
-    return c.json({ country: "", countryCode: "", region: "", city: "" });
+    return c.json(empty);
   }
 });
 
