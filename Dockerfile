@@ -60,15 +60,11 @@ ENV POSTHOG_API_KEY=${POSTHOG_API_KEY}
 RUN bunx prisma generate
 RUN bun run build
 
-# Copy NGINX configuration
-RUN mkdir -p /etc/nginx/sites-available \
-    && mkdir -p /etc/nginx/sites-enabled \
-    && ln -s /etc/nginx/sites-available/app.conf /etc/nginx/sites-enabled/
+# Remove default nginx site and install our config
+RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/conf.d/app.conf
 
-COPY nginx.conf /etc/nginx/sites-available/app.conf
-
-# Expose required ports
-EXPOSE 3000 80 443
+EXPOSE 80
 
 # Use a script to start both NGINX and your Node app
 COPY start.sh /start.sh
