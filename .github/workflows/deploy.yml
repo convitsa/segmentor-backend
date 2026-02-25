@@ -59,7 +59,7 @@ jobs:
           docker build \
             --build-arg DATABASE_URL="${{ secrets.DATABASE_URL }}" \
             --build-arg JWT_SECRET="${{ secrets.JWT_SECRET }}" \
-            --build-arg CORS_ORIGIN="${{ secrets.CORS_ORIGIN }}" \
+            --build-arg CORS_ORIGIN="${{ vars.CORS_ORIGIN }}" \
             --build-arg PORT="${{ vars.PORT }}" \
             --build-arg GOOGLE_CLIENT_ID="${{ vars.GOOGLE_CLIENT_ID }}" \
             --build-arg GOOGLE_CLIENT_SECRET="${{ secrets.GOOGLE_CLIENT_SECRET }}" \
