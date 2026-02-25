@@ -1,0 +1,34 @@
+{
+  "name": "segmentor-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "db:push": "bunx prisma db push",
+    "db:generate": "bunx prisma generate",
+    "db:studio": "bunx prisma studio",
+    "db:seed": "bun run prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.4.1",
+    "google-auth-library": "^10.5.0",
+    "hono": "^4.7.4",
+    "hono-rate-limiter": "^0.5.3",
+    "jsonwebtoken": "^9.0.2",
+    "mime-types": "^3.0.2",
+    "nanoid": "^5.1.2",
+    "posthog-node": "^5.25.0",
+    "resend": "^6.9.2",
+    "stripe": "^20.3.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/mime-types": "^3.0.1",
+    "prisma": "^6.4.1",
+    "typescript": "^5.7.3"
+  }
+}
