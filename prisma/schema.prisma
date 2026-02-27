@@ -138,3 +138,127 @@ model Event {
   @@index([projectId, timestamp])
   @@index([projectId, variantId])
 }
+
+// ─── User Journey Tracking ───────────────────────────────────────────
+
+model Visitor {
+  id               String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId        String   @db.ObjectId
+  visitorId        String
+  country          String?
+  countryCode      String?
+  region           String?
+  city             String?
+  language         String?
+  device           String?
+  browser          String?
+  os               String?
+  firstReferrer    String?
+  firstUtmSource   String?
+  firstUtmMedium   String?
+  firstUtmCampaign String?
+  totalSessions    Int      @default(0)
+  totalPageviews   Int      @default(0)
+  totalEvents      Int      @default(0)
+  email            String?
+  polarCustomerId  String?
+  totalRevenue     Int      @default(0)
+  tags             String[]
+  firstSeenAt      DateTime @default(now())
+  lastSeenAt       DateTime @default(now())
+
+  @@unique([projectId, visitorId])
+  @@index([projectId, lastSeenAt])
+  @@index([projectId, email])
+  @@index([projectId, firstSeenAt])
+}
+
+model Session {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId   String   @db.ObjectId
+  visitorId   String
+  sessionId   String
+  entryPage   String?
+  exitPage    String?
+  referrer    String?
+  utmSource   String?
+  utmMedium   String?
+  utmCampaign String?
+  device      String?
+  browser     String?
+  os          String?
+  country     String?
+  countryCode String?
+  pageviews   Int      @default(0)
+  events      Int      @default(0)
+  duration    Int      @default(0)
+  startedAt   DateTime @default(now())
+  endedAt     DateTime @default(now())
+
+  @@unique([projectId, sessionId])
+  @@index([projectId, startedAt])
+  @@index([projectId, visitorId])
+}
+
+model PageView {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId   String   @db.ObjectId
+  visitorId   String
+  sessionId   String
+  url         String
+  title       String?
+  referrer    String?
+  duration    Int?
+  scrollDepth Int?
+  timestamp   DateTime @default(now())
+
+  @@index([projectId, timestamp])
+  @@index([projectId, visitorId])
+  @@index([projectId, sessionId])
+}
+
+model TrackEvent {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId  String   @db.ObjectId
+  visitorId  String
+  sessionId  String
+  name       String
+  properties Json?
+  url        String?
+  timestamp  DateTime @default(now())
+
+  @@index([projectId, timestamp])
+  @@index([projectId, visitorId])
+  @@index([projectId, sessionId])
+  @@index([projectId, name])
+}
+
+model Integration {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId String   @db.ObjectId
+  type      String
+  config    Json
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, type])
+}
+
+model CustomerEvent {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId     String   @db.ObjectId
+  visitorId     String?
+  type          String
+  amount        Int?
+  currency      String?
+  productName   String?
+  customerEmail String?
+  externalId    String?
+  provider      String
+  metadata      Json?
+  timestamp     DateTime @default(now())
+
+  @@index([projectId, timestamp])
+  @@index([projectId, visitorId])
+}

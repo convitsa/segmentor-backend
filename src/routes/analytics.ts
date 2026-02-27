@@ -203,4 +203,171 @@ analytics.get("/projects/:projectId/analytics", async (c) => {
   });
 });
 
+// User-centric analytics overview (new journey-based metrics)
+analytics.get("/projects/:projectId/analytics/overview", async (c) => {
+  const userId = c.get("userId");
+  const projectId = c.req.param("projectId");
+  await requireProjectOwnership(projectId, userId);
+
+  const rawDays = parseInt(c.req.query("days") || "7", 10);
+  const days = Math.max(1, Math.min(isNaN(rawDays) ? 7 : rawDays, 90));
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  const prevSince = new Date(since);
+  prevSince.setDate(prevSince.getDate() - days);
+
+  const [
+    visitors, prevVisitors,
+    sessions, prevSessions,
+    pageviews,
+    revenueResult,
+    topPages,
+  ] = await Promise.all([
+    prisma.visitor.findMany({
+      where: { projectId, lastSeenAt: { gte: since } },
+      select: { visitorId: true, firstSeenAt: true, totalRevenue: true, countryCode: true, country: true, device: true },
+    }),
+    prisma.visitor.findMany({
+      where: { projectId, lastSeenAt: { gte: prevSince, lt: since } },
+      select: { visitorId: true },
+    }),
+    prisma.session.findMany({
+      where: { projectId, startedAt: { gte: since } },
+      select: { sessionId: true, visitorId: true, duration: true, pageviews: true, startedAt: true },
+    }),
+    prisma.session.findMany({
+      where: { projectId, startedAt: { gte: prevSince, lt: since } },
+      select: { sessionId: true },
+    }),
+    prisma.pageView.findMany({
+      where: { projectId, timestamp: { gte: since } },
+      select: { url: true, visitorId: true, timestamp: true },
+    }),
+    prisma.customerEvent.aggregate({
+      where: { projectId, timestamp: { gte: since }, type: "purchase" },
+      _sum: { amount: true },
+      _count: true,
+    }),
+    prisma.pageView.groupBy({
+      by: ["url"],
+      where: { projectId, timestamp: { gte: since } },
+      _count: { id: true },
+      orderBy: { _count: { id: "desc" } },
+      take: 20,
+    }),
+  ]);
+
+  const totalVisitors = visitors.length;
+  const prevTotalVisitors = prevVisitors.length;
+  const newVisitors = visitors.filter((v) => new Date(v.firstSeenAt) >= since).length;
+  const returningVisitors = totalVisitors - newVisitors;
+  const totalSessions = sessions.length;
+  const prevTotalSessions = prevSessions.length;
+  const totalPageviews = pageviews.length;
+  const totalRevenue = revenueResult._sum.amount || 0;
+  const totalOrders = revenueResult._count;
+
+  const avgSessionDuration = totalSessions > 0
+    ? Math.round(sessions.reduce((sum, s) => sum + s.duration, 0) / totalSessions)
+    : 0;
+  const bounceSessions = sessions.filter((s) => s.pageviews <= 1).length;
+  const bounceRate = totalSessions > 0 ? Math.round((bounceSessions / totalSessions) * 100) : 0;
+
+  // Daily stats (visitors + sessions + pageviews)
+  const byDay: Record<string, {
+    visitors: Set<string>; newVisitors: Set<string>;
+    sessions: number; pageviews: number;
+  }> = {};
+
+  for (let d = 0; d < days; d++) {
+    const date = new Date(since);
+    date.setDate(date.getDate() + d);
+    const key = date.toISOString().slice(0, 10);
+    byDay[key] = { visitors: new Set(), newVisitors: new Set(), sessions: 0, pageviews: 0 };
+  }
+
+  for (const pv of pageviews) {
+    const day = pv.timestamp.toISOString().slice(0, 10);
+    if (byDay[day]) {
+      byDay[day].pageviews++;
+      byDay[day].visitors.add(pv.visitorId);
+    }
+  }
+
+  for (const s of sessions) {
+    const day = s.startedAt.toISOString().slice(0, 10);
+    if (byDay[day]) byDay[day].sessions++;
+  }
+
+  const visitorsWithFirstSeen = new Map(visitors.map((v) => [v.visitorId, v.firstSeenAt]));
+  for (const pv of pageviews) {
+    const day = pv.timestamp.toISOString().slice(0, 10);
+    if (byDay[day]) {
+      const firstSeen = visitorsWithFirstSeen.get(pv.visitorId);
+      if (firstSeen && new Date(firstSeen) >= since) {
+        byDay[day].newVisitors.add(pv.visitorId);
+      }
+    }
+  }
+
+  const dailyStats = Object.entries(byDay)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, d]) => ({
+      date,
+      visitors: d.visitors.size,
+      newVisitors: d.newVisitors.size,
+      returningVisitors: d.visitors.size - d.newVisitors.size,
+      sessions: d.sessions,
+      pageviews: d.pageviews,
+    }));
+
+  // Country stats from visitors
+  const byCountry: Record<string, { visitors: number; revenue: number }> = {};
+  for (const v of visitors) {
+    const cc = v.countryCode || v.country || "Unknown";
+    if (!byCountry[cc]) byCountry[cc] = { visitors: 0, revenue: 0 };
+    byCountry[cc].visitors++;
+    byCountry[cc].revenue += v.totalRevenue;
+  }
+  const countryStats = Object.entries(byCountry)
+    .map(([code, d]) => ({ countryCode: code, visitors: d.visitors, revenue: d.revenue }))
+    .sort((a, b) => b.visitors - a.visitors)
+    .slice(0, 20);
+
+  // Device stats from visitors
+  const byDevice: Record<string, number> = {};
+  for (const v of visitors) {
+    const dev = v.device || "unknown";
+    byDevice[dev] = (byDevice[dev] || 0) + 1;
+  }
+  const deviceStats = Object.entries(byDevice)
+    .map(([device, count]) => ({ device, visitors: count }))
+    .sort((a, b) => b.visitors - a.visitors);
+
+  // Top pages by actual pageviews
+  const pageStats = topPages.map((p) => ({
+    url: p.url,
+    pageviews: p._count.id,
+  }));
+
+  return c.json({
+    period: { days, since: since.toISOString() },
+    totalVisitors,
+    previousPeriod: { totalVisitors: prevTotalVisitors, totalSessions: prevTotalSessions },
+    newVisitors,
+    returningVisitors,
+    totalSessions,
+    totalPageviews,
+    avgSessionDuration,
+    bounceRate,
+    totalRevenue,
+    totalOrders,
+    dailyStats,
+    countryStats,
+    deviceStats,
+    pageStats,
+  });
+});
+
 export default analytics;

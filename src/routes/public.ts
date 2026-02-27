@@ -68,6 +68,7 @@ const trackBodySchema = z.object({
   events: z.array(trackEventSchema).min(1).max(500),
 });
 
+// Legacy endpoint kept for backward compatibility
 pub.post("/track", async (c) => {
   try {
     const raw = await c.req.json();
@@ -98,6 +99,302 @@ pub.post("/track", async (c) => {
     });
     return c.json({ ok: true });
   } catch {
+    return c.json({ ok: false }, 500);
+  }
+});
+
+/* ───── New Ingest Endpoint (full journey tracking) ───── */
+
+const ingestEventSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("pageview"),
+    url: z.string(),
+    title: z.string().optional(),
+    referrer: z.string().optional(),
+    ts: z.number(),
+  }),
+  z.object({
+    type: z.literal("pageview_end"),
+    url: z.string(),
+    properties: z.object({
+      duration: z.number().optional(),
+      scrollDepth: z.number().optional(),
+    }),
+    ts: z.number(),
+  }),
+  z.object({
+    type: z.literal("click"),
+    url: z.string().optional(),
+    properties: z.object({
+      tag: z.string().optional(),
+      text: z.string().optional(),
+      href: z.string().optional(),
+    }).passthrough(),
+    ts: z.number(),
+  }),
+  z.object({
+    type: z.literal("form_submit"),
+    url: z.string().optional(),
+    properties: z.object({
+      formId: z.string().optional(),
+      action: z.string().optional(),
+      method: z.string().optional(),
+    }).passthrough(),
+    ts: z.number(),
+  }),
+  z.object({
+    type: z.literal("identify"),
+    properties: z.object({
+      email: z.string().email(),
+    }),
+    ts: z.number(),
+  }),
+  z.object({
+    type: z.literal("impression"),
+    elementId: z.string(),
+    variantId: z.string(),
+    ruleId: z.string().nullable().optional(),
+    url: z.string().optional(),
+    country: z.string().optional(),
+    countryCode: z.string().optional(),
+    device: z.string().optional(),
+    ts: z.number(),
+  }),
+  z.object({
+    type: z.literal("custom"),
+    name: z.string(),
+    url: z.string().optional(),
+    properties: z.record(z.unknown()).optional(),
+    ts: z.number(),
+  }),
+]);
+
+const ingestBodySchema = z.object({
+  projectKey: z.string().min(1),
+  visitorId: z.string().min(1),
+  sessionId: z.string().min(1),
+  context: z.object({
+    language: z.string().optional(),
+    device: z.string().optional(),
+    browser: z.string().optional(),
+    os: z.string().optional(),
+    screenWidth: z.number().optional(),
+    referrer: z.string().optional(),
+    utm: z.object({
+      source: z.string().optional(),
+      medium: z.string().optional(),
+      campaign: z.string().optional(),
+      term: z.string().optional(),
+      content: z.string().optional(),
+    }).optional(),
+  }).optional(),
+  geo: z.object({
+    country: z.string().optional(),
+    countryCode: z.string().optional(),
+    region: z.string().optional(),
+    city: z.string().optional(),
+  }).optional(),
+  events: z.array(ingestEventSchema).min(1).max(500),
+});
+
+pub.post("/ingest", async (c) => {
+  try {
+    const text = await c.req.text();
+    const raw = JSON.parse(text);
+    const parsed = ingestBodySchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ ok: false, error: parsed.error.flatten().fieldErrors }, 400);
+    }
+    const body = parsed.data;
+    const project = await prisma.project.findUnique({
+      where: { publicKey: body.projectKey },
+      select: { id: true },
+    });
+    if (!project) return c.json({ ok: false }, 404);
+
+    const pid = project.id;
+    const vid = body.visitorId;
+    const sid = body.sessionId;
+    const ctx = body.context || {};
+    const geo = body.geo || {};
+    const utm = ctx.utm || {};
+
+    const pageviews: Array<{
+      projectId: string; visitorId: string; sessionId: string;
+      url: string; title?: string; referrer?: string; timestamp: Date;
+    }> = [];
+    const trackEvents: Array<{
+      projectId: string; visitorId: string; sessionId: string;
+      name: string; properties?: any; url?: string; timestamp: Date;
+    }> = [];
+    const impressions: Array<{
+      projectId: string; visitorId: string; elementId: string;
+      variantId: string; ruleId: string | null; type: string;
+      url: string | null; country: string | null;
+      countryCode: string | null; device: string | null;
+    }> = [];
+    let identifyEmail: string | null = null;
+    let pageviewEndUpdates: Array<{
+      url: string; duration?: number; scrollDepth?: number;
+    }> = [];
+
+    let pvCount = 0;
+    let evtCount = 0;
+    let firstPageUrl: string | null = null;
+    let lastPageUrl: string | null = null;
+
+    for (const evt of body.events) {
+      const ts = new Date(evt.ts);
+
+      if (evt.type === "pageview") {
+        pvCount++;
+        if (!firstPageUrl) firstPageUrl = evt.url;
+        lastPageUrl = evt.url;
+        pageviews.push({
+          projectId: pid, visitorId: vid, sessionId: sid,
+          url: evt.url, title: evt.title || undefined,
+          referrer: evt.referrer || undefined, timestamp: ts,
+        });
+      } else if (evt.type === "pageview_end") {
+        pageviewEndUpdates.push({
+          url: evt.url,
+          duration: evt.properties?.duration,
+          scrollDepth: evt.properties?.scrollDepth,
+        });
+      } else if (evt.type === "click" || evt.type === "form_submit") {
+        evtCount++;
+        trackEvents.push({
+          projectId: pid, visitorId: vid, sessionId: sid,
+          name: evt.type, properties: evt.properties || {},
+          url: evt.url || undefined, timestamp: ts,
+        });
+      } else if (evt.type === "custom") {
+        evtCount++;
+        trackEvents.push({
+          projectId: pid, visitorId: vid, sessionId: sid,
+          name: evt.name, properties: evt.properties || {},
+          url: evt.url || undefined, timestamp: ts,
+        });
+      } else if (evt.type === "identify") {
+        identifyEmail = evt.properties.email;
+      } else if (evt.type === "impression") {
+        impressions.push({
+          projectId: pid, visitorId: vid,
+          elementId: evt.elementId, variantId: evt.variantId,
+          ruleId: evt.ruleId || null, type: "impression",
+          url: evt.url || null, country: evt.country || null,
+          countryCode: evt.countryCode || null, device: evt.device || null,
+        });
+      }
+    }
+
+    const now = new Date();
+    const ops: Promise<unknown>[] = [];
+
+    // Upsert Visitor
+    const visitorUpdate: Record<string, unknown> = {
+      lastSeenAt: now,
+      totalPageviews: { increment: pvCount },
+      totalEvents: { increment: evtCount },
+    };
+    if (geo.country) visitorUpdate.country = geo.country;
+    if (geo.countryCode) visitorUpdate.countryCode = geo.countryCode;
+    if (geo.region) visitorUpdate.region = geo.region;
+    if (geo.city) visitorUpdate.city = geo.city;
+    if (ctx.language) visitorUpdate.language = ctx.language;
+    if (ctx.device) visitorUpdate.device = ctx.device;
+    if (ctx.browser) visitorUpdate.browser = ctx.browser;
+    if (ctx.os) visitorUpdate.os = ctx.os;
+    if (identifyEmail) visitorUpdate.email = identifyEmail;
+
+    ops.push(
+      prisma.visitor.upsert({
+        where: { projectId_visitorId: { projectId: pid, visitorId: vid } },
+        create: {
+          projectId: pid, visitorId: vid,
+          country: geo.country || null, countryCode: geo.countryCode || null,
+          region: geo.region || null, city: geo.city || null,
+          language: ctx.language || null, device: ctx.device || null,
+          browser: ctx.browser || null, os: ctx.os || null,
+          firstReferrer: ctx.referrer || null,
+          firstUtmSource: utm.source || null,
+          firstUtmMedium: utm.medium || null,
+          firstUtmCampaign: utm.campaign || null,
+          totalSessions: 1, totalPageviews: pvCount, totalEvents: evtCount,
+          email: identifyEmail, firstSeenAt: now, lastSeenAt: now,
+        },
+        update: visitorUpdate,
+      })
+    );
+
+    // Upsert Session
+    ops.push(
+      prisma.session.upsert({
+        where: { projectId_sessionId: { projectId: pid, sessionId: sid } },
+        create: {
+          projectId: pid, visitorId: vid, sessionId: sid,
+          entryPage: firstPageUrl, exitPage: lastPageUrl,
+          referrer: ctx.referrer || null,
+          utmSource: utm.source || null, utmMedium: utm.medium || null,
+          utmCampaign: utm.campaign || null,
+          device: ctx.device || null, browser: ctx.browser || null,
+          os: ctx.os || null, country: geo.country || null,
+          countryCode: geo.countryCode || null,
+          pageviews: pvCount, events: evtCount,
+          startedAt: now, endedAt: now,
+        },
+        update: {
+          endedAt: now,
+          exitPage: lastPageUrl || undefined,
+          pageviews: { increment: pvCount },
+          events: { increment: evtCount },
+        },
+      })
+    );
+
+    if (pageviews.length > 0) {
+      ops.push(prisma.pageView.createMany({ data: pageviews }));
+    }
+    if (trackEvents.length > 0) {
+      ops.push(prisma.trackEvent.createMany({ data: trackEvents }));
+    }
+    if (impressions.length > 0) {
+      ops.push(prisma.event.createMany({ data: impressions }));
+    }
+
+    // Handle pageview_end updates (update most recent matching pageview)
+    for (const pu of pageviewEndUpdates) {
+      ops.push(
+        prisma.pageView.findFirst({
+          where: { projectId: pid, visitorId: vid, sessionId: sid, url: pu.url },
+          orderBy: { timestamp: "desc" },
+        }).then((pv) => {
+          if (!pv) return;
+          return prisma.pageView.update({
+            where: { id: pv.id },
+            data: {
+              duration: pu.duration ?? undefined,
+              scrollDepth: pu.scrollDepth ?? undefined,
+            },
+          });
+        })
+      );
+    }
+
+    // If identify, also link unlinked CustomerEvents
+    if (identifyEmail) {
+      ops.push(
+        prisma.customerEvent.updateMany({
+          where: { projectId: pid, customerEmail: identifyEmail, visitorId: null },
+          data: { visitorId: vid },
+        })
+      );
+    }
+
+    await Promise.all(ops);
+    return c.json({ ok: true });
+  } catch (err) {
+    console.error("Ingest error:", err);
     return c.json({ ok: false }, 500);
   }
 });

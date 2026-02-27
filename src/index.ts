@@ -15,6 +15,8 @@ import publicRoutes from "./routes/public.js";
 import billingRoutes from "./routes/billing.js";
 import uploadRoutes from "./routes/uploads.js";
 import adminRoutes from "./routes/admin.js";
+import visitorsRoutes from "./routes/visitors.js";
+import integrationsRoutes, { polarWebhookHandler } from "./routes/integrations.js";
 import { requireAuth } from "./auth/middleware.js";
 import { requireSubscription } from "./auth/require-subscription.js";
 import { requireAdmin } from "./auth/require-admin.js";
@@ -90,6 +92,18 @@ app.use(
   })
 );
 
+app.use(
+  "/public/ingest",
+  rateLimiter({
+    windowMs: 60 * 1000,
+    limit: 120,
+    keyGenerator: (c) =>
+      c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
+      c.req.header("x-real-ip") ||
+      "unknown",
+  })
+);
+
 app.route("/api/auth", authRoutes);
 app.route("/api/billing", billingRoutes);
 
@@ -106,10 +120,13 @@ protected_.route("", variantRoutes);
 protected_.route("", ruleRoutes);
 protected_.route("", audienceRoutes);
 protected_.route("", analyticsRoutes);
+protected_.route("", visitorsRoutes);
+protected_.route("", integrationsRoutes);
 protected_.route("/uploads", uploadRoutes);
 app.route("/api", protected_);
 
 app.route("/public", publicRoutes);
+app.route("/public", polarWebhookHandler);
 
 app.onError((err, c) => {
   if (err instanceof HTTPException) {
