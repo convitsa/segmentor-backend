@@ -93,7 +93,7 @@ polarWebhookHandler.post("/webhooks/polar/:projectId", async (c) => {
   }
 
   const config = integration.config as { webhookSecret: string };
-  const rawBody = await c.req.text();
+  const rawBody = await c.req.raw.text();
 
   const webhookId = c.req.header("webhook-id") || "";
   const webhookTimestamp = c.req.header("webhook-timestamp") || "";
