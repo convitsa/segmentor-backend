@@ -27,9 +27,7 @@ integrations.get("/projects/:projectId/integrations", async (c) => {
 });
 
 const polarConnectSchema = z.object({
-  accessToken: z.string().min(1),
   webhookSecret: z.string().min(1),
-  organizationId: z.string().optional(),
 });
 
 integrations.post("/projects/:projectId/integrations/polar", async (c) => {
