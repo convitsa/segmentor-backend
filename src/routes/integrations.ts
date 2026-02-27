@@ -100,7 +100,8 @@ polarWebhookHandler.post("/webhooks/polar/:projectId", async (c) => {
   const webhookSignature = c.req.header("webhook-signature") || "";
 
   try {
-    const wh = new Webhook(config.webhookSecret);
+    const encodedSecret = Buffer.from(config.webhookSecret).toString("base64");
+    const wh = new Webhook(encodedSecret);
     wh.verify(rawBody, {
       "webhook-id": webhookId,
       "webhook-timestamp": webhookTimestamp,
