@@ -459,8 +459,17 @@ pub.post("/ingest", async (c) => {
       events: evtCount,
       email: identifyEmail || null,
       country: geo.country || null,
+      countryCode: geo.countryCode || null,
+      region: geo.region || null,
       city: geo.city || null,
+      language: ctx.language || null,
       device: ctx.device || null,
+      browser: ctx.browser || null,
+      os: ctx.os || null,
+      referrer: ctx.referrer || null,
+      utmSource: utm.source || null,
+      utmMedium: utm.medium || null,
+      utmCampaign: utm.campaign || null,
       timestamp: ts,
     });
 

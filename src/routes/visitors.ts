@@ -22,8 +22,19 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
   const search = c.req.query("search") || "";
   const filterCountry = c.req.query("country") || "";
   const filterDevice = c.req.query("device") || "";
+  const filterBrowser = c.req.query("browser") || "";
+  const filterOs = c.req.query("os") || "";
+  const filterLanguage = c.req.query("language") || "";
   const filterIdentified = c.req.query("identified"); // "true" | "false"
   const filterHasRevenue = c.req.query("hasRevenue"); // "true"
+  const filterLive = c.req.query("live"); // "true"
+  const filterUtmSource = c.req.query("utmSource") || "";
+  const filterUtmMedium = c.req.query("utmMedium") || "";
+  const filterUtmCampaign = c.req.query("utmCampaign") || "";
+  const filterReferrer = c.req.query("referrer") || "";
+  const filterTag = c.req.query("tag") || "";
+  const filterSeenAfter = c.req.query("seenAfter") || "";
+  const filterSeenBefore = c.req.query("seenBefore") || "";
   const sortBy = c.req.query("sortBy") || "lastSeenAt";
   const sortOrder = c.req.query("sortOrder") === "asc" ? "asc" : "desc";
 
@@ -34,6 +45,7 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
       { email: { contains: search, mode: "insensitive" } },
       { visitorId: { contains: search } },
       { city: { contains: search, mode: "insensitive" } },
+      { name: { contains: search, mode: "insensitive" } },
     ];
   }
   if (filterCountry) {
@@ -41,6 +53,15 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
   }
   if (filterDevice) {
     where.device = filterDevice.toLowerCase();
+  }
+  if (filterBrowser) {
+    where.browser = { contains: filterBrowser, mode: "insensitive" };
+  }
+  if (filterOs) {
+    where.os = { contains: filterOs, mode: "insensitive" };
+  }
+  if (filterLanguage) {
+    where.language = { contains: filterLanguage, mode: "insensitive" };
   }
   if (filterIdentified === "true") {
     where.email = { not: null };
@@ -50,8 +71,32 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
   if (filterHasRevenue === "true") {
     where.totalRevenue = { gt: 0 };
   }
+  if (filterLive === "true") {
+    where.lastSeenAt = { gte: new Date(Date.now() - 5 * 60 * 1000) };
+  }
+  if (filterUtmSource) {
+    where.firstUtmSource = { contains: filterUtmSource, mode: "insensitive" };
+  }
+  if (filterUtmMedium) {
+    where.firstUtmMedium = { contains: filterUtmMedium, mode: "insensitive" };
+  }
+  if (filterUtmCampaign) {
+    where.firstUtmCampaign = { contains: filterUtmCampaign, mode: "insensitive" };
+  }
+  if (filterReferrer) {
+    where.firstReferrer = { contains: filterReferrer, mode: "insensitive" };
+  }
+  if (filterTag) {
+    where.tags = { has: filterTag };
+  }
+  if (filterSeenAfter || filterSeenBefore) {
+    const lastSeenFilter: Record<string, Date> = {};
+    if (filterSeenAfter) lastSeenFilter.gte = new Date(filterSeenAfter);
+    if (filterSeenBefore) lastSeenFilter.lte = new Date(filterSeenBefore);
+    if (!where.lastSeenAt) where.lastSeenAt = lastSeenFilter;
+  }
 
-  const allowedSorts = ["lastSeenAt", "firstSeenAt", "totalPageviews", "totalSessions", "totalRevenue", "totalEvents"];
+  const allowedSorts = ["lastSeenAt", "firstSeenAt", "totalPageviews", "totalSessions", "totalRevenue", "totalEvents", "email"];
   const orderField = allowedSorts.includes(sortBy) ? sortBy : "lastSeenAt";
 
   const projectWhere = { projectId };
@@ -90,6 +135,47 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
       paidVisitors: paidCount,
       totalRevenue: aggregates._sum.totalRevenue ?? 0,
     },
+  });
+});
+
+// Distinct filter values for populating dropdowns
+visitors.get("/projects/:projectId/visitors/filters", async (c) => {
+  const userId = c.get("userId");
+  const projectId = c.req.param("projectId");
+  await requireProjectOwnership(projectId, userId);
+
+  const all = await prisma.visitor.findMany({
+    where: { projectId },
+    select: {
+      countryCode: true,
+      country: true,
+      language: true,
+      browser: true,
+      os: true,
+      device: true,
+      firstReferrer: true,
+      firstUtmSource: true,
+      firstUtmMedium: true,
+      firstUtmCampaign: true,
+      tags: true,
+    },
+  });
+
+  function distinct(arr: (string | null | undefined)[]): string[] {
+    return [...new Set(arr.filter((v): v is string => !!v))].sort();
+  }
+
+  return c.json({
+    countries: distinct(all.map((v) => v.countryCode ? `${v.countryCode}|${v.country || v.countryCode}` : null)),
+    languages: distinct(all.map((v) => v.language)),
+    browsers: distinct(all.map((v) => v.browser)),
+    os: distinct(all.map((v) => v.os)),
+    devices: distinct(all.map((v) => v.device)),
+    referrers: distinct(all.map((v) => v.firstReferrer)),
+    utmSources: distinct(all.map((v) => v.firstUtmSource)),
+    utmMediums: distinct(all.map((v) => v.firstUtmMedium)),
+    utmCampaigns: distinct(all.map((v) => v.firstUtmCampaign)),
+    tags: distinct(all.flatMap((v) => v.tags)),
   });
 });
 
