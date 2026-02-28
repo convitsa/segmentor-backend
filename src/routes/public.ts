@@ -5,7 +5,7 @@ import { prisma } from "../db/index.js";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { lookup } from "mime-types";
-import { broadcast } from "../lib/sse-hub.js";
+import { broadcast } from "../lib/websocket-hub.js";
 
 function isSafeUrl(url: string): boolean {
   let parsed: URL;
@@ -394,6 +394,64 @@ pub.post("/ingest", async (c) => {
 
     await Promise.all(ops);
 
+    const ts = now.toISOString();
+
+    for (const evt of body.events) {
+      if (evt.type === "pageview") {
+        broadcast(pid, "live:pageview", {
+          visitorId: vid, sessionId: sid,
+          url: evt.url, title: evt.title || null, referrer: evt.referrer || null,
+          timestamp: ts,
+        });
+      } else if (evt.type === "pageview_end") {
+        broadcast(pid, "live:pageview_end", {
+          visitorId: vid, sessionId: sid,
+          url: evt.url,
+          duration: evt.properties?.duration ?? null,
+          scrollDepth: evt.properties?.scrollDepth ?? null,
+          timestamp: ts,
+        });
+      } else if (evt.type === "click") {
+        broadcast(pid, "live:click", {
+          visitorId: vid, sessionId: sid,
+          url: evt.url || null,
+          tag: evt.properties?.tag || null,
+          text: evt.properties?.text || null,
+          href: evt.properties?.href || null,
+          timestamp: ts,
+        });
+      } else if (evt.type === "form_submit") {
+        broadcast(pid, "live:form_submit", {
+          visitorId: vid, sessionId: sid,
+          url: evt.url || null,
+          formId: evt.properties?.formId || null,
+          action: evt.properties?.action || null,
+          method: evt.properties?.method || null,
+          timestamp: ts,
+        });
+      } else if (evt.type === "identify") {
+        broadcast(pid, "live:identify", {
+          visitorId: vid, sessionId: sid,
+          email: evt.properties?.email || null,
+          timestamp: ts,
+        });
+      } else if (evt.type === "custom") {
+        broadcast(pid, "live:custom", {
+          visitorId: vid, sessionId: sid,
+          name: evt.name, url: evt.url || null,
+          properties: evt.properties || {},
+          timestamp: ts,
+        });
+      } else if (evt.type === "impression") {
+        broadcast(pid, "live:impression", {
+          visitorId: vid, sessionId: sid,
+          elementId: evt.elementId, variantId: evt.variantId,
+          ruleId: evt.ruleId || null, url: evt.url || null,
+          timestamp: ts,
+        });
+      }
+    }
+
     broadcast(pid, "visitor_update", {
       visitorId: vid,
       sessionId: sid,
@@ -403,7 +461,7 @@ pub.post("/ingest", async (c) => {
       country: geo.country || null,
       city: geo.city || null,
       device: ctx.device || null,
-      timestamp: now.toISOString(),
+      timestamp: ts,
     });
 
     return c.json({ ok: true });

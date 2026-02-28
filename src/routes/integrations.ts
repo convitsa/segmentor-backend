@@ -4,7 +4,7 @@ import { Webhook } from "standardwebhooks";
 import { requireAuth } from "../auth/middleware.js";
 import { requireProjectOwnership } from "../lib/ownership.js";
 import { prisma } from "../db/index.js";
-import { broadcast } from "../lib/sse-hub.js";
+import { broadcast } from "../lib/websocket-hub.js";
 
 type Env = { Variables: { userId: string } };
 

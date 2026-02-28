@@ -1,10 +1,7 @@
 import { Hono } from "hono";
-import { streamSSE } from "hono/streaming";
 import { requireAuth } from "../auth/middleware.js";
 import { requireProjectOwnership } from "../lib/ownership.js";
 import { prisma } from "../db/index.js";
-import { hub } from "../lib/sse-hub.js";
-import { verifyToken } from "../auth/jwt.js";
 
 type Env = { Variables: { userId: string } };
 
@@ -268,46 +265,3 @@ visitors.get("/projects/:projectId/sessions", async (c) => {
 });
 
 export default visitors;
-
-// SSE live stream — exported separately, mounted outside requireAuth middleware
-export const sseHandler = new Hono();
-
-sseHandler.get("/projects/:projectId/live", async (c) => {
-  const projectId = c.req.param("projectId");
-
-  const queryToken = c.req.query("token");
-  if (!queryToken) return c.json({ error: "Unauthorized" }, 401);
-
-  let userId: string;
-  try {
-    const payload = verifyToken(queryToken);
-    userId = payload.userId;
-  } catch {
-    return c.json({ error: "Invalid token" }, 401);
-  }
-
-  await requireProjectOwnership(projectId, userId);
-
-  return streamSSE(c, async (stream) => {
-    const channel = `project:${projectId}`;
-
-    const listener = (msg: { event: string; data: unknown }) => {
-      stream.writeSSE({ event: msg.event, data: JSON.stringify(msg.data) }).catch(() => {});
-    };
-
-    hub.on(channel, listener);
-
-    stream.onAbort(() => {
-      hub.off(channel, listener);
-    });
-
-    await stream.writeSSE({ event: "connected", data: JSON.stringify({ ok: true }) });
-
-    while (!stream.closed) {
-      await stream.writeSSE({ event: "heartbeat", data: "" });
-      await stream.sleep(30_000);
-    }
-
-    hub.off(channel, listener);
-  });
-});
