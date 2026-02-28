@@ -1,7 +1,10 @@
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { requireAuth } from "../auth/middleware.js";
 import { requireProjectOwnership } from "../lib/ownership.js";
 import { prisma } from "../db/index.js";
+import { hub } from "../lib/sse-hub.js";
+import { verifyToken } from "../auth/jwt.js";
 
 type Env = { Variables: { userId: string } };
 
@@ -54,7 +57,9 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
   const allowedSorts = ["lastSeenAt", "firstSeenAt", "totalPageviews", "totalSessions", "totalRevenue", "totalEvents"];
   const orderField = allowedSorts.includes(sortBy) ? sortBy : "lastSeenAt";
 
-  const [items, total] = await Promise.all([
+  const projectWhere = { projectId };
+
+  const [items, total, aggregates] = await Promise.all([
     prisma.visitor.findMany({
       where: where as any,
       orderBy: { [orderField]: sortOrder },
@@ -62,6 +67,16 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
       take: limit,
     }),
     prisma.visitor.count({ where: where as any }),
+    prisma.visitor.aggregate({
+      where: projectWhere,
+      _sum: { totalRevenue: true },
+      _count: { _all: true },
+    }),
+  ]);
+
+  const [identifiedCount, paidCount] = await Promise.all([
+    prisma.visitor.count({ where: { projectId, email: { not: null } } }),
+    prisma.visitor.count({ where: { projectId, totalRevenue: { gt: 0 } } }),
   ]);
 
   return c.json({
@@ -71,6 +86,12 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
       limit,
       total,
       totalPages: Math.ceil(total / limit),
+    },
+    stats: {
+      totalVisitors: aggregates._count._all,
+      identifiedVisitors: identifiedCount,
+      paidVisitors: paidCount,
+      totalRevenue: aggregates._sum.totalRevenue ?? 0,
     },
   });
 });
@@ -246,32 +267,47 @@ visitors.get("/projects/:projectId/sessions", async (c) => {
   });
 });
 
-// Live visitors (active within last 5 minutes)
-visitors.get("/projects/:projectId/live", async (c) => {
-  const userId = c.get("userId");
+export default visitors;
+
+// SSE live stream — exported separately, mounted outside requireAuth middleware
+export const sseHandler = new Hono();
+
+sseHandler.get("/projects/:projectId/live", async (c) => {
   const projectId = c.req.param("projectId");
+
+  const queryToken = c.req.query("token");
+  if (!queryToken) return c.json({ error: "Unauthorized" }, 401);
+
+  let userId: string;
+  try {
+    const payload = verifyToken(queryToken);
+    userId = payload.userId;
+  } catch {
+    return c.json({ error: "Invalid token" }, 401);
+  }
+
   await requireProjectOwnership(projectId, userId);
 
-  const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
+  return streamSSE(c, async (stream) => {
+    const channel = `project:${projectId}`;
 
-  const [activeVisitors, recentPageviews] = await Promise.all([
-    prisma.visitor.findMany({
-      where: { projectId, lastSeenAt: { gte: fiveMinAgo } },
-      orderBy: { lastSeenAt: "desc" },
-      take: 100,
-    }),
-    prisma.pageView.findMany({
-      where: { projectId, timestamp: { gte: fiveMinAgo } },
-      orderBy: { timestamp: "desc" },
-      take: 50,
-    }),
-  ]);
+    const listener = (msg: { event: string; data: unknown }) => {
+      stream.writeSSE({ event: msg.event, data: JSON.stringify(msg.data) }).catch(() => {});
+    };
 
-  return c.json({
-    count: activeVisitors.length,
-    visitors: activeVisitors,
-    recentPageviews,
+    hub.on(channel, listener);
+
+    stream.onAbort(() => {
+      hub.off(channel, listener);
+    });
+
+    await stream.writeSSE({ event: "connected", data: JSON.stringify({ ok: true }) });
+
+    while (!stream.closed) {
+      await stream.writeSSE({ event: "heartbeat", data: "" });
+      await stream.sleep(30_000);
+    }
+
+    hub.off(channel, listener);
   });
 });
-
-export default visitors;

@@ -4,6 +4,7 @@ import { Webhook } from "standardwebhooks";
 import { requireAuth } from "../auth/middleware.js";
 import { requireProjectOwnership } from "../lib/ownership.js";
 import { prisma } from "../db/index.js";
+import { broadcast } from "../lib/sse-hub.js";
 
 type Env = { Variables: { userId: string } };
 
@@ -193,24 +194,49 @@ polarWebhookHandler.post("/webhooks/polar/:projectId", async (c) => {
     },
   });
 
-  // Update visitor revenue if purchase matched
-  if (matchedVisitorId && amount && ceType === "purchase") {
+  const customerName: string | null = data.customer?.name || null;
+
+  // Update visitor with payment data and customer details
+  if (matchedVisitorId && ceType === "purchase" && amount) {
+    const visitorUpdate: Record<string, unknown> = {
+      totalRevenue: { increment: amount },
+      polarCustomerId: data.customer?.id || undefined,
+    };
+    if (customerName) visitorUpdate.name = customerName;
+    if (customerEmail) visitorUpdate.email = customerEmail.toLowerCase();
+
     await prisma.visitor.update({
       where: { projectId_visitorId: { projectId, visitorId: matchedVisitorId } },
-      data: {
-        totalRevenue: { increment: amount },
-        polarCustomerId: data.customer?.id || undefined,
-      },
+      data: visitorUpdate as any,
     });
-  }
-
-  // Handle refunds
-  if (matchedVisitorId && amount && ceType === "refund") {
+  } else if (matchedVisitorId && ceType === "refund" && amount) {
     await prisma.visitor.update({
       where: { projectId_visitorId: { projectId, visitorId: matchedVisitorId } },
       data: { totalRevenue: { decrement: amount } },
     });
+  } else if (matchedVisitorId && (ceType === "subscription_created" || ceType === "subscription_canceled")) {
+    const visitorUpdate: Record<string, unknown> = {};
+    if (customerName) visitorUpdate.name = customerName;
+    if (customerEmail) visitorUpdate.email = customerEmail.toLowerCase();
+    if (data.customer?.id) visitorUpdate.polarCustomerId = data.customer.id;
+    if (Object.keys(visitorUpdate).length > 0) {
+      await prisma.visitor.update({
+        where: { projectId_visitorId: { projectId, visitorId: matchedVisitorId } },
+        data: visitorUpdate as any,
+      });
+    }
   }
+
+  broadcast(projectId, "purchase", {
+    visitorId: matchedVisitorId,
+    type: ceType,
+    amount,
+    currency,
+    productName,
+    customerEmail,
+    customerName,
+    timestamp: new Date().toISOString(),
+  });
 
   return c.json({ received: true });
 });

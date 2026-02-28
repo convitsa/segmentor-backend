@@ -161,6 +161,7 @@ model Visitor {
   totalPageviews   Int      @default(0)
   totalEvents      Int      @default(0)
   email            String?
+  name             String?
   polarCustomerId  String?
   totalRevenue     Int      @default(0)
   tags             String[]

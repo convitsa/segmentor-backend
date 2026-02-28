@@ -15,7 +15,7 @@ import publicRoutes from "./routes/public.js";
 import billingRoutes from "./routes/billing.js";
 import uploadRoutes from "./routes/uploads.js";
 import adminRoutes from "./routes/admin.js";
-import visitorsRoutes from "./routes/visitors.js";
+import visitorsRoutes, { sseHandler } from "./routes/visitors.js";
 import integrationsRoutes, { polarWebhookHandler } from "./routes/integrations.js";
 import { requireAuth } from "./auth/middleware.js";
 import { requireSubscription } from "./auth/require-subscription.js";
@@ -112,6 +112,8 @@ adminProtected.use("/*", requireAuth, requireAdmin);
 adminProtected.route("", adminRoutes);
 app.route("/api/admin", adminProtected);
 
+app.route("/api/sse", sseHandler);
+
 const protected_ = new Hono();
 protected_.use("/*", requireAuth, requireSubscription);
 protected_.route("/projects", projectRoutes);
@@ -159,4 +161,5 @@ process.on("SIGINT", async () => {
 export default {
   port: PORT,
   fetch: app.fetch,
+  idleTimeout: 255,
 };

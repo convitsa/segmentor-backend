@@ -5,6 +5,7 @@ import { prisma } from "../db/index.js";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { lookup } from "mime-types";
+import { broadcast } from "../lib/sse-hub.js";
 
 function isSafeUrl(url: string): boolean {
   let parsed: URL;
@@ -392,6 +393,19 @@ pub.post("/ingest", async (c) => {
     }
 
     await Promise.all(ops);
+
+    broadcast(pid, "visitor_update", {
+      visitorId: vid,
+      sessionId: sid,
+      pageviews: pvCount,
+      events: evtCount,
+      email: identifyEmail || null,
+      country: geo.country || null,
+      city: geo.city || null,
+      device: ctx.device || null,
+      timestamp: now.toISOString(),
+    });
+
     return c.json({ ok: true });
   } catch (err) {
     console.error("Ingest error:", err);
@@ -460,8 +474,8 @@ pub.get("/geo", async (c) => {
 const PICKER_SCRIPT = `
 <script data-segmentor-picker>
 (function(){
-  var BRAND = "#098DB9";
-  var BRAND_RGB = "9,141,185";
+  var BRAND = "#171717";
+  var BRAND_RGB = "23,23,23";
   var IDS = {
     overlay: "__seg_overlay",
     label: "__seg_label",
