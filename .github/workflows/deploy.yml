@@ -70,6 +70,9 @@ jobs:
             --build-arg RESEND_API_KEY="${{ secrets.RESEND_API_KEY }}" \
             --build-arg EMAIL_FROM="${{ vars.EMAIL_FROM }}" \
             --build-arg POSTHOG_API_KEY="${{ secrets.POSTHOG_API_KEY }}" \
+            --build-arg AZURE_OPENAI_ENDPOINT="${{ secrets.AZURE_OPENAI_ENDPOINT }}" \
+            --build-arg AZURE_OPENAI_API_KEY="${{ secrets.AZURE_OPENAI_API_KEY }}" \
+            --build-arg AZURE_OPENAI_DEPLOYMENT="${{ secrets.AZURE_OPENAI_DEPLOYMENT }}" \
             -t ${{ steps.names.outputs.image_tag }} \
             -f Dockerfile .
 
