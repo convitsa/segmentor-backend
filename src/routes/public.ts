@@ -6,6 +6,7 @@ import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { lookup } from "mime-types";
 import { broadcast } from "../lib/websocket-hub.js";
+import { friendlyName } from "../lib/friendly-name.js";
 
 function isSafeUrl(url: string): boolean {
   let parsed: URL;
@@ -168,6 +169,10 @@ const ingestEventSchema = z.discriminatedUnion("type", [
     properties: z.record(z.unknown()).optional(),
     ts: z.number(),
   }),
+  z.object({
+    type: z.literal("session_end"),
+    ts: z.number(),
+  }),
 ]);
 
 const ingestBodySchema = z.object({
@@ -243,6 +248,7 @@ pub.post("/ingest", async (c) => {
     let evtCount = 0;
     let firstPageUrl: string | null = null;
     let lastPageUrl: string | null = null;
+    let hasSessionEnd = false;
 
     for (const evt of body.events) {
       const ts = new Date(evt.ts);
@@ -286,6 +292,8 @@ pub.post("/ingest", async (c) => {
           url: evt.url || null, country: evt.country || null,
           countryCode: evt.countryCode || null, device: evt.device || null,
         });
+      } else if (evt.type === "session_end") {
+        hasSessionEnd = true;
       }
     }
 
@@ -313,6 +321,8 @@ pub.post("/ingest", async (c) => {
         where: { projectId_visitorId: { projectId: pid, visitorId: vid } },
         create: {
           projectId: pid, visitorId: vid,
+          name: identifyEmail ? null : friendlyName(vid),
+          isRandomName: !identifyEmail,
           country: geo.country || null, countryCode: geo.countryCode || null,
           region: geo.region || null, city: geo.city || null,
           language: ctx.language || null, device: ctx.device || null,
@@ -449,29 +459,36 @@ pub.post("/ingest", async (c) => {
           ruleId: evt.ruleId || null, url: evt.url || null,
           timestamp: ts,
         });
+      } else if (evt.type === "session_end") {
+        broadcast(pid, "visitor_offline", {
+          visitorId: vid, sessionId: sid,
+          timestamp: ts,
+        });
       }
     }
 
-    broadcast(pid, "visitor_update", {
-      visitorId: vid,
-      sessionId: sid,
-      pageviews: pvCount,
-      events: evtCount,
-      email: identifyEmail || null,
-      country: geo.country || null,
-      countryCode: geo.countryCode || null,
-      region: geo.region || null,
-      city: geo.city || null,
-      language: ctx.language || null,
-      device: ctx.device || null,
-      browser: ctx.browser || null,
-      os: ctx.os || null,
-      referrer: ctx.referrer || null,
-      utmSource: utm.source || null,
-      utmMedium: utm.medium || null,
-      utmCampaign: utm.campaign || null,
-      timestamp: ts,
-    });
+    if (!hasSessionEnd) {
+      broadcast(pid, "visitor_update", {
+        visitorId: vid,
+        sessionId: sid,
+        pageviews: pvCount,
+        events: evtCount,
+        email: identifyEmail || null,
+        country: geo.country || null,
+        countryCode: geo.countryCode || null,
+        region: geo.region || null,
+        city: geo.city || null,
+        language: ctx.language || null,
+        device: ctx.device || null,
+        browser: ctx.browser || null,
+        os: ctx.os || null,
+        referrer: ctx.referrer || null,
+        utmSource: utm.source || null,
+        utmMedium: utm.medium || null,
+        utmCampaign: utm.campaign || null,
+        timestamp: ts,
+      });
+    }
 
     return c.json({ ok: true });
   } catch (err) {

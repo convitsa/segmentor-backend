@@ -441,15 +441,25 @@
   }
 
   /* ───── PAGE EXIT ───── */
+  var sessionEndSent = false;
+
   function onPageExit() {
     endCurrentPage();
+    if (!sessionEndSent) {
+      sessionEndSent = true;
+      queueEvent({ type: "session_end" });
+    }
     flushEvents();
   }
 
   document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "hidden") onPageExit();
+    if (document.visibilityState === "hidden") {
+      onPageExit();
+    } else if (document.visibilityState === "visible") {
+      sessionEndSent = false;
+    }
   });
-  window.addEventListener("beforeunload", onPageExit);
+  window.addEventListener("pagehide", onPageExit);
 
   /* ───── PUBLIC API ───── */
   window.segmentor = window.segmentor || {};

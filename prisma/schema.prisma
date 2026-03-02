@@ -162,6 +162,7 @@ model Visitor {
   totalEvents      Int      @default(0)
   email            String?
   name             String?
+  isRandomName     Boolean  @default(false)
   polarCustomerId  String?
   totalRevenue     Int      @default(0)
   tags             String[]
@@ -244,6 +245,43 @@ model Integration {
   updatedAt DateTime @updatedAt
 
   @@unique([projectId, type])
+}
+
+model SavedSegment {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId    String   @db.ObjectId
+  name         String
+  naturalQuery String
+  filters      Json
+  createdAt    DateTime @default(now())
+
+  @@index([projectId])
+}
+
+model SegiConversation {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId String   @db.ObjectId
+  title     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages SegiMessage[]
+
+  @@index([projectId, updatedAt])
+}
+
+model SegiMessage {
+  id             String           @id @default(auto()) @map("_id") @db.ObjectId
+  conversationId String           @db.ObjectId
+  conversation   SegiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String
+  content        String
+  toolName       String?
+  toolInput      Json?
+  toolOutput     Json?
+  createdAt      DateTime         @default(now())
+
+  @@index([conversationId, createdAt])
 }
 
 model CustomerEvent {
