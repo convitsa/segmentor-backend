@@ -53,14 +53,15 @@ model Subscription {
 }
 
 model Project {
-  id        String   @id @default(auto()) @map("_id") @db.ObjectId
-  userId    String   @db.ObjectId
-  user      User     @relation(fields: [userId], references: [id])
-  name      String
-  siteUrl   String
-  publicKey String   @unique
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id               String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId           String   @db.ObjectId
+  user             User     @relation(fields: [userId], references: [id])
+  name             String
+  siteUrl          String
+  publicKey        String   @unique
+  recordingEnabled Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   elements  ElementConfig[]
   audiences Audience[]
@@ -282,6 +283,33 @@ model SegiMessage {
   createdAt      DateTime         @default(now())
 
   @@index([conversationId, createdAt])
+}
+
+model SessionRecording {
+  id               String   @id @default(auto()) @map("_id") @db.ObjectId
+  projectId        String   @db.ObjectId
+  visitorId        String
+  sessionId        String
+  status           String   @default("recording") // recording, ready, analyzing, analyzed, failed
+  eventsFile       String?
+  eventsCount      Int      @default(0)
+  duration         Int      @default(0)
+  pagesVisited     String[]
+  startedAt        DateTime @default(now())
+  endedAt          DateTime?
+
+  summary          String?
+  journeySteps     Json?
+  clickPoints      Json?
+  frictionPoints   Json?
+  conversionEvents Json?
+  sentiment        String?
+  analyzedAt       DateTime?
+
+  @@unique([projectId, sessionId])
+  @@index([projectId, startedAt])
+  @@index([projectId, visitorId])
+  @@index([projectId, status])
 }
 
 model CustomerEvent {

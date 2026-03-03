@@ -69,5 +69,6 @@ export async function getProjectConfig(
     id: project.id,
     siteUrl: project.siteUrl,
     elements,
+    recordingEnabled: project.recordingEnabled ?? false,
   };
 }
