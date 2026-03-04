@@ -1,18 +1,21 @@
 import { HTTPException } from "hono/http-exception";
-import { prisma } from "../db/index.js";
+import {
+  Project,
+  ElementConfig,
+  Variant,
+  Audience,
+  Rule,
+} from "../db/models.js";
 
 export async function requireProjectOwnership(
   projectId: string,
   userId: string
 ) {
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { userId: true },
-  });
+  const project = await Project.findById(projectId).select("userId");
   if (!project) {
     throw new HTTPException(404, { message: "Project not found" });
   }
-  if (project.userId !== userId) {
+  if (project.userId?.toString() !== userId) {
     throw new HTTPException(403, { message: "Forbidden" });
   }
 }
@@ -21,14 +24,12 @@ export async function requireElementOwnership(
   elementId: string,
   userId: string
 ) {
-  const element = await prisma.elementConfig.findUnique({
-    where: { id: elementId },
-    include: { project: { select: { userId: true } } },
-  });
+  const element = await ElementConfig.findById(elementId);
   if (!element) {
     throw new HTTPException(404, { message: "Element not found" });
   }
-  if (element.project.userId !== userId) {
+  const project = await Project.findById(element.projectId).select("userId");
+  if (!project || project.userId?.toString() !== userId) {
     throw new HTTPException(403, { message: "Forbidden" });
   }
   return element;
@@ -38,42 +39,44 @@ export async function requireVariantOwnership(
   variantId: string,
   userId: string
 ) {
-  const variant = await prisma.variant.findUnique({
-    where: { id: variantId },
-    include: { element: { include: { project: { select: { userId: true } } } } },
-  });
+  const variant = await Variant.findById(variantId);
   if (!variant) {
     throw new HTTPException(404, { message: "Variant not found" });
   }
-  if (variant.element.project.userId !== userId) {
+  const element = await ElementConfig.findById(variant.elementId);
+  if (!element) {
+    throw new HTTPException(404, { message: "Element not found" });
+  }
+  const project = await Project.findById(element.projectId).select("userId");
+  if (!project || project.userId?.toString() !== userId) {
     throw new HTTPException(403, { message: "Forbidden" });
   }
   return variant;
 }
 
 export async function requireAudienceOwnership(audienceId: string, userId: string) {
-  const audience = await prisma.audience.findUnique({
-    where: { id: audienceId },
-    include: { project: { select: { userId: true } } },
-  });
+  const audience = await Audience.findById(audienceId);
   if (!audience) {
     throw new HTTPException(404, { message: "Audience not found" });
   }
-  if (audience.project.userId !== userId) {
+  const project = await Project.findById(audience.projectId).select("userId");
+  if (!project || project.userId?.toString() !== userId) {
     throw new HTTPException(403, { message: "Forbidden" });
   }
   return audience;
 }
 
 export async function requireRuleOwnership(ruleId: string, userId: string) {
-  const rule = await prisma.rule.findUnique({
-    where: { id: ruleId },
-    include: { element: { include: { project: { select: { userId: true } } } } },
-  });
+  const rule = await Rule.findById(ruleId);
   if (!rule) {
     throw new HTTPException(404, { message: "Rule not found" });
   }
-  if (rule.element.project.userId !== userId) {
+  const element = await ElementConfig.findById(rule.elementId);
+  if (!element) {
+    throw new HTTPException(404, { message: "Element not found" });
+  }
+  const project = await Project.findById(element.projectId).select("userId");
+  if (!project || project.userId?.toString() !== userId) {
     throw new HTTPException(403, { message: "Forbidden" });
   }
   return rule;

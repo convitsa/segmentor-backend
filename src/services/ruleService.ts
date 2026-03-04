@@ -1,4 +1,4 @@
-import { prisma } from "../db/index.js";
+import { Rule } from "../db/models.js";
 import type { Condition, Split } from "../types/dto.js";
 
 export async function createRule(
@@ -16,20 +16,18 @@ export async function createRule(
     audienceId?: string | null;
   }
 ) {
-  return prisma.rule.create({
-    data: {
-      elementId,
-      description: data.description,
-      conditions: data.conditions as any,
-      logic: data.logic,
-      variantId: data.variantId,
-      priority: data.priority,
-      enabled: data.enabled ?? true,
-      startDate: data.startDate ? new Date(data.startDate) : null,
-      endDate: data.endDate ? new Date(data.endDate) : null,
-      splits: data.splits as any ?? undefined,
-      audienceId: data.audienceId ?? null,
-    },
+  return Rule.create({
+    elementId,
+    description: data.description,
+    conditions: data.conditions as any,
+    logic: data.logic,
+    variantId: data.variantId,
+    priority: data.priority,
+    enabled: data.enabled ?? true,
+    startDate: data.startDate ? new Date(data.startDate) : undefined,
+    endDate: data.endDate ? new Date(data.endDate) : undefined,
+    splits: (data.splits as any) ?? undefined,
+    audienceId: data.audienceId ?? undefined,
   });
 }
 
@@ -59,9 +57,9 @@ export async function updateRule(
   if (data.endDate !== undefined) updateData.endDate = data.endDate ? new Date(data.endDate) : null;
   if (data.splits !== undefined) updateData.splits = data.splits as any ?? null;
   if (data.audienceId !== undefined) updateData.audienceId = data.audienceId ?? null;
-  return prisma.rule.update({ where: { id }, data: updateData });
+  return Rule.findByIdAndUpdate(id, updateData, { returnDocument: "after" });
 }
 
 export async function deleteRule(id: string) {
-  return prisma.rule.delete({ where: { id } });
+  return Rule.findByIdAndDelete(id);
 }

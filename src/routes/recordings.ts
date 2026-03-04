@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
-import { prisma } from "../db/index.js";
+import { Project, SessionRecording, Visitor } from "../db/models.js";
 import { requireAuth } from "../auth/middleware.js";
 import { requireProjectOwnership } from "../lib/ownership.js";
 import { analyzeRecording } from "../services/recording-analyzer.js";
@@ -36,10 +36,7 @@ publicRecordingRoute.post("/recording", async (c) => {
 
     const { projectKey, visitorId, sessionId, chunk, chunkIndex, isFinal } = parsed.data;
 
-    const project = await prisma.project.findUnique({
-      where: { publicKey: projectKey },
-      select: { id: true, recordingEnabled: true },
-    });
+    const project = await Project.findOne({ publicKey: projectKey }).select("id recordingEnabled");
     if (!project || !project.recordingEnabled) {
       return c.json({ ok: false }, 404);
     }
@@ -75,41 +72,35 @@ publicRecordingRoute.post("/recording", async (c) => {
 
     const now = new Date();
 
-    await prisma.sessionRecording.upsert({
-      where: { projectId_sessionId: { projectId: pid, sessionId } },
-      create: {
-        projectId: pid,
-        visitorId,
-        sessionId,
-        status: isFinal ? "ready" : "recording",
-        eventsFile: relPath,
-        eventsCount: chunk.length,
-        pagesVisited: [...pages],
-        startedAt: now,
-        endedAt: isFinal ? now : undefined,
+    await SessionRecording.findOneAndUpdate(
+      { projectId: pid, sessionId },
+      {
+        $setOnInsert: {
+          projectId: pid,
+          visitorId,
+          sessionId,
+          startedAt: now,
+        },
+        $set: {
+          eventsFile: relPath,
+          ...(isFinal ? { status: "ready", endedAt: now } : { status: "recording" }),
+        },
+        $inc: { eventsCount: chunk.length },
+        $addToSet: { pagesVisited: { $each: [...pages] } },
       },
-      update: {
-        eventsCount: { increment: chunk.length },
-        pagesVisited: { push: [...pages] },
-        ...(isFinal ? { status: "ready", endedAt: now } : {}),
-      },
-    });
+      { upsert: true, returnDocument: "after" }
+    );
 
     if (isFinal) {
-      const rec = await prisma.sessionRecording.findUnique({
-        where: { projectId_sessionId: { projectId: pid, sessionId } },
-      });
+      const rec = await SessionRecording.findOne({ projectId: pid, sessionId });
       if (rec) {
         const startMs = rec.startedAt.getTime();
         const endMs = now.getTime();
         const durationSec = Math.round((endMs - startMs) / 1000);
-        await prisma.sessionRecording.update({
-          where: { id: rec.id },
-          data: { duration: durationSec },
-        });
+        await SessionRecording.findByIdAndUpdate(rec.id, { duration: durationSec }, { returnDocument: "after" });
 
-        analyzeRecording(rec.id).catch((err) =>
-          console.error("[Recording] Analysis failed:", err?.message || err)
+        analyzeRecording(rec.id).catch((err: unknown) =>
+          console.error("[Recording] Analysis failed:", (err as Error)?.message || err)
         );
       }
     }
@@ -136,54 +127,38 @@ recordings.get("/projects/:projectId/recordings", async (c) => {
   const limit = Math.min(parseInt(c.req.query("limit") || "20", 10), 100);
   const skip = (page - 1) * limit;
 
-  const where: Record<string, unknown> = { projectId };
+  const mongoWhere: Record<string, unknown> = { projectId };
 
   const status = c.req.query("status");
-  if (status) where.status = status;
+  if (status) mongoWhere.status = status;
 
   const sentiment = c.req.query("sentiment");
-  if (sentiment) where.sentiment = sentiment;
+  if (sentiment) mongoWhere.sentiment = sentiment;
 
   const visitorId = c.req.query("visitorId");
-  if (visitorId) where.visitorId = { contains: visitorId, mode: "insensitive" };
+  if (visitorId) mongoWhere.visitorId = { $regex: visitorId, $options: "i" };
 
   const dateFrom = c.req.query("dateFrom");
   const dateTo = c.req.query("dateTo");
   if (dateFrom || dateTo) {
-    where.startedAt = {};
-    if (dateFrom) (where.startedAt as any).gte = new Date(dateFrom);
-    if (dateTo) (where.startedAt as any).lte = new Date(dateTo);
+    mongoWhere.startedAt = {};
+    if (dateFrom) (mongoWhere.startedAt as Record<string, Date>).$gte = new Date(dateFrom);
+    if (dateTo) (mongoWhere.startedAt as Record<string, Date>).$lte = new Date(dateTo);
   }
 
   const [total, items] = await Promise.all([
-    prisma.sessionRecording.count({ where: where as any }),
-    prisma.sessionRecording.findMany({
-      where: where as any,
-      orderBy: { startedAt: "desc" },
-      skip,
-      take: limit,
-      select: {
-        id: true,
-        visitorId: true,
-        sessionId: true,
-        status: true,
-        eventsCount: true,
-        duration: true,
-        pagesVisited: true,
-        startedAt: true,
-        endedAt: true,
-        summary: true,
-        sentiment: true,
-        analyzedAt: true,
-      },
-    }),
+    SessionRecording.countDocuments(mongoWhere),
+    SessionRecording.find(mongoWhere)
+      .sort({ startedAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .select("visitorId sessionId status eventsCount duration pagesVisited startedAt endedAt summary sentiment analyzedAt"),
   ]);
 
   const visitorIds = [...new Set(items.map((r) => r.visitorId))];
-  const visitors = await prisma.visitor.findMany({
-    where: { projectId, visitorId: { in: visitorIds } },
-    select: { visitorId: true, name: true, email: true, country: true, countryCode: true, device: true },
-  });
+  const visitors = await Visitor.find({ projectId, visitorId: { $in: visitorIds } }).select(
+    "visitorId name email country countryCode device"
+  );
   const visitorMap = new Map(visitors.map((v) => [v.visitorId, v]));
 
   const enriched = items.map((r) => ({
@@ -203,15 +178,12 @@ recordings.get("/projects/:projectId/recordings/:id", async (c) => {
   const id = c.req.param("id");
   await requireProjectOwnership(projectId, userId);
 
-  const rec = await prisma.sessionRecording.findFirst({
-    where: { id, projectId },
-  });
+  const rec = await SessionRecording.findOne({ _id: id, projectId });
   if (!rec) return c.json({ error: "Recording not found" }, 404);
 
-  const visitor = await prisma.visitor.findFirst({
-    where: { projectId, visitorId: rec.visitorId },
-    select: { visitorId: true, name: true, email: true, country: true, countryCode: true, city: true, device: true, browser: true, os: true },
-  });
+  const visitor = await Visitor.findOne({ projectId, visitorId: rec.visitorId }).select(
+    "visitorId name email country countryCode city device browser os"
+  );
 
   return c.json({ recording: { ...rec, visitor } });
 });
@@ -222,10 +194,7 @@ recordings.get("/projects/:projectId/recordings/:id/events", async (c) => {
   const id = c.req.param("id");
   await requireProjectOwnership(projectId, userId);
 
-  const rec = await prisma.sessionRecording.findFirst({
-    where: { id, projectId },
-    select: { eventsFile: true },
-  });
+  const rec = await SessionRecording.findOne({ _id: id, projectId }).select("eventsFile");
   if (!rec || !rec.eventsFile) return c.json({ error: "Recording not found" }, 404);
 
   const fullPath = join(UPLOADS_DIR, "..", rec.eventsFile);
@@ -242,9 +211,7 @@ recordings.delete("/projects/:projectId/recordings/:id", async (c) => {
   const id = c.req.param("id");
   await requireProjectOwnership(projectId, userId);
 
-  const rec = await prisma.sessionRecording.findFirst({
-    where: { id, projectId },
-  });
+  const rec = await SessionRecording.findOne({ _id: id, projectId });
   if (!rec) return c.json({ error: "Recording not found" }, 404);
 
   if (rec.eventsFile) {
@@ -252,7 +219,7 @@ recordings.delete("/projects/:projectId/recordings/:id", async (c) => {
     try { unlinkSync(fullPath); } catch {}
   }
 
-  await prisma.sessionRecording.delete({ where: { id } });
+  await SessionRecording.findByIdAndDelete(id);
   return c.json({ ok: true });
 });
 
@@ -262,18 +229,13 @@ recordings.post("/projects/:projectId/recordings/:id/analyze", async (c) => {
   const id = c.req.param("id");
   await requireProjectOwnership(projectId, userId);
 
-  const rec = await prisma.sessionRecording.findFirst({
-    where: { id, projectId },
-  });
+  const rec = await SessionRecording.findOne({ _id: id, projectId });
   if (!rec) return c.json({ error: "Recording not found" }, 404);
 
-  await prisma.sessionRecording.update({
-    where: { id },
-    data: { status: "analyzing" },
-  });
+  await SessionRecording.findByIdAndUpdate(id, { status: "analyzing" }, { returnDocument: "after" });
 
-  analyzeRecording(id).catch((err) =>
-    console.error("[Recording] Re-analysis failed:", err?.message || err)
+  analyzeRecording(id).catch((err: unknown) =>
+    console.error("[Recording] Re-analysis failed:", (err as Error)?.message || err)
   );
 
   return c.json({ ok: true, message: "Analysis started" });
@@ -285,10 +247,7 @@ recordings.patch("/projects/:projectId/settings/recording", async (c) => {
   await requireProjectOwnership(projectId, userId);
 
   const body = await c.req.json<{ enabled: boolean }>();
-  await prisma.project.update({
-    where: { id: projectId },
-    data: { recordingEnabled: !!body.enabled },
-  });
+  await Project.findByIdAndUpdate(projectId, { recordingEnabled: !!body.enabled }, { returnDocument: "after" });
 
   return c.json({ ok: true, recordingEnabled: !!body.enabled });
 });

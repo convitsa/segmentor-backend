@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { OAuth2Client } from "google-auth-library";
-import { prisma } from "../db/index.js";
+import { User, Project, ElementConfig, Rule, Variant, Audience, Event } from "../db/models.js";
 import { hashPassword, verifyPassword, signToken } from "../auth/jwt.js";
 import { requireAuth } from "../auth/middleware.js";
 import { fireEmail } from "../email/send.js";
@@ -32,15 +32,13 @@ auth.post("/signup", async (c) => {
 
   const { email, password } = parsed.data;
 
-  const existing = await prisma.user.findUnique({ where: { email } });
+  const existing = await User.findOne({ email });
   if (existing) {
     return c.json({ error: "Email already registered" }, 409);
   }
 
   const passwordHash = await hashPassword(password);
-  const user = await prisma.user.create({
-    data: { email, passwordHash },
-  });
+  const user = await User.create({ email, passwordHash });
 
   const welcome = welcomeEmail(email);
   fireEmail(email, welcome.subject, welcome.html);
@@ -48,7 +46,7 @@ auth.post("/signup", async (c) => {
 
   const token = signToken(user.id);
   const response: AuthResponse = {
-    user: { id: user.id, email: user.email, name: user.name ?? undefined, createdAt: user.createdAt.toISOString() },
+    user: { id: user.id, email: user.email, name: user.name ?? undefined, createdAt: (user as any).createdAt?.toISOString() ?? new Date().toISOString() },
     token,
   };
 
@@ -64,7 +62,7 @@ auth.post("/login", async (c) => {
 
   const { email, password } = parsed.data;
 
-  const user = await prisma.user.findUnique({ where: { email } });
+  const user = await User.findOne({ email });
   if (!user || !user.passwordHash) {
     return c.json({ error: "Invalid credentials" }, 401);
   }
@@ -78,7 +76,7 @@ auth.post("/login", async (c) => {
 
   const token = signToken(user.id);
   const response: AuthResponse = {
-    user: { id: user.id, email: user.email, name: user.name ?? undefined, createdAt: user.createdAt.toISOString() },
+    user: { id: user.id, email: user.email, name: user.name ?? undefined, createdAt: (user as any).createdAt?.toISOString() ?? new Date().toISOString() },
     token,
   };
 
@@ -112,20 +110,15 @@ auth.post("/google", async (c) => {
   const googleId = payload.sub;
   const email = payload.email;
 
-  let user = await prisma.user.findFirst({ where: { googleId } });
+  let user = await User.findOne({ googleId });
 
   if (!user) {
-    user = await prisma.user.findUnique({ where: { email } });
-    if (user) {
-      user = await prisma.user.update({
-        where: { id: user.id },
-        data: { googleId },
-      });
-      captureEvent(user.id, "user_logged_in", { method: "google" });
+    const existingByEmail = await User.findOne({ email });
+    if (existingByEmail) {
+      user = await User.findByIdAndUpdate(existingByEmail.id, { googleId }, { returnDocument: "after" });
+      if (user) captureEvent(user.id, "user_logged_in", { method: "google" });
     } else {
-      user = await prisma.user.create({
-        data: { email, googleId },
-      });
+      user = await User.create({ email, googleId });
       const welcome = welcomeEmail(email);
       fireEmail(email, welcome.subject, welcome.html);
       captureEvent(user.id, "user_signed_up", { method: "google", email });
@@ -134,9 +127,11 @@ auth.post("/google", async (c) => {
     captureEvent(user.id, "user_logged_in", { method: "google" });
   }
 
+  if (!user) return c.json({ error: "Could not create or update user" }, 500);
+
   const token = signToken(user.id);
   const response: AuthResponse = {
-    user: { id: user.id, email: user.email, name: user.name ?? undefined, createdAt: user.createdAt.toISOString() },
+    user: { id: user.id, email: user.email, name: user.name ?? undefined, createdAt: (user as any).createdAt?.toISOString() ?? new Date().toISOString() },
     token,
   };
 
@@ -147,7 +142,7 @@ auth.post("/google", async (c) => {
 
 auth.get("/me", requireAuth, async (c) => {
   const userId = c.get("userId");
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const user = await User.findById(userId);
   if (!user) return c.json({ error: "User not found" }, 404);
 
   return c.json({
@@ -156,7 +151,7 @@ auth.get("/me", requireAuth, async (c) => {
     hasPassword: !!user.passwordHash,
     hasGoogle: !!user.googleId,
     role: user.role,
-    createdAt: user.createdAt.toISOString(),
+    createdAt: (user as any).createdAt?.toISOString() ?? new Date().toISOString(),
   });
 });
 
@@ -172,16 +167,14 @@ auth.patch("/profile", requireAuth, async (c) => {
     return c.json({ error: parsed.error.flatten().fieldErrors }, 400);
   }
 
-  const user = await prisma.user.update({
-    where: { id: userId },
-    data: { name: parsed.data.name },
-  });
+  const user = await User.findByIdAndUpdate(userId, { name: parsed.data.name }, { returnDocument: "after" });
+  if (!user) return c.json({ error: "User not found" }, 404);
 
   return c.json({
     id: user.id,
     email: user.email,
     name: user.name,
-    createdAt: user.createdAt.toISOString(),
+    createdAt: (user as any).createdAt?.toISOString() ?? new Date().toISOString(),
   });
 });
 
@@ -198,7 +191,7 @@ auth.patch("/password", requireAuth, async (c) => {
     return c.json({ error: parsed.error.flatten().fieldErrors }, 400);
   }
 
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const user = await User.findById(userId);
   if (!user || !user.passwordHash) {
     return c.json({ error: "Password change not available for this account" }, 400);
   }
@@ -209,7 +202,7 @@ auth.patch("/password", requireAuth, async (c) => {
   }
 
   const newHash = await hashPassword(parsed.data.newPassword);
-  await prisma.user.update({ where: { id: userId }, data: { passwordHash: newHash } });
+  await User.findByIdAndUpdate(userId, { passwordHash: newHash });
 
   const pwEmail = passwordChangedEmail();
   fireEmail(user.email, pwEmail.subject, pwEmail.html);
@@ -229,14 +222,14 @@ auth.post("/set-password", requireAuth, async (c) => {
     return c.json({ error: parsed.error.flatten().fieldErrors }, 400);
   }
 
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const user = await User.findById(userId);
   if (!user) return c.json({ error: "User not found" }, 404);
   if (user.passwordHash) {
     return c.json({ error: "Password already set. Use the change password endpoint." }, 400);
   }
 
   const hash = await hashPassword(parsed.data.newPassword);
-  await prisma.user.update({ where: { id: userId }, data: { passwordHash: hash } });
+  await User.findByIdAndUpdate(userId, { passwordHash: hash });
 
   const pwEmail = passwordChangedEmail();
   fireEmail(user.email, pwEmail.subject, pwEmail.html);
@@ -247,34 +240,31 @@ auth.post("/set-password", requireAuth, async (c) => {
 auth.delete("/account", requireAuth, async (c) => {
   const userId = c.get("userId");
 
-  const userToDelete = await prisma.user.findUnique({ where: { id: userId } });
+  const userToDelete = await User.findById(userId);
   if (userToDelete) {
     const delEmail = accountDeletedEmail();
     fireEmail(userToDelete.email, delEmail.subject, delEmail.html);
   }
 
-  const projects = await prisma.project.findMany({ where: { userId }, select: { id: true } });
-  const projectIds = projects.map((p) => p.id);
+  const projects = await Project.find({ userId }).select("_id").lean();
+  const projectIds = projects.map((p) => p._id);
 
   if (projectIds.length > 0) {
-    const elements = await prisma.elementConfig.findMany({
-      where: { projectId: { in: projectIds } },
-      select: { id: true },
-    });
-    const elementIds = elements.map((e) => e.id);
+    const elements = await ElementConfig.find({ projectId: { $in: projectIds } }).select("_id").lean();
+    const elementIds = elements.map((e) => e._id);
 
     if (elementIds.length > 0) {
-      await prisma.rule.deleteMany({ where: { elementId: { in: elementIds } } });
-      await prisma.variant.deleteMany({ where: { elementId: { in: elementIds } } });
-      await prisma.elementConfig.deleteMany({ where: { id: { in: elementIds } } });
+      await Rule.deleteMany({ elementId: { $in: elementIds } });
+      await Variant.deleteMany({ elementId: { $in: elementIds } });
+      await ElementConfig.deleteMany({ _id: { $in: elementIds } });
     }
 
-    await prisma.audience.deleteMany({ where: { projectId: { in: projectIds } } });
-    await prisma.event.deleteMany({ where: { projectId: { in: projectIds } } });
-    await prisma.project.deleteMany({ where: { userId } });
+    await Audience.deleteMany({ projectId: { $in: projectIds } });
+    await Event.deleteMany({ projectId: { $in: projectIds } });
+    await Project.deleteMany({ userId });
   }
 
-  await prisma.user.delete({ where: { id: userId } });
+  await User.findByIdAndDelete(userId);
 
   return c.json({ message: "Account deleted successfully" });
 });

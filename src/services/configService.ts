@@ -1,41 +1,52 @@
-import { prisma } from "../db/index.js";
+import { Project, ElementConfig, Variant, Rule, Audience } from "../db/models.js";
 import type { ProjectConfigDTO, ElementConfigDTO, VariantDTO, RuleDTO, VariantMutation, Condition, Split } from "../types/dto.js";
 
 export async function getProjectConfig(
   publicKey: string
 ): Promise<ProjectConfigDTO | null> {
-  const project = await prisma.project.findUnique({
-    where: { publicKey },
-    include: {
-      elements: {
-        include: {
-          variants: true,
-          rules: true,
-        },
-      },
-      audiences: true,
-    },
-  });
-
+  const project = await Project.findOne({ publicKey });
   if (!project) return null;
 
-  const audienceMap = new Map(
-    project.audiences.map((a) => [a.id, a])
-  );
+  const [elementsData, audiences] = await Promise.all([
+    ElementConfig.find({ projectId: project._id }),
+    Audience.find({ projectId: project._id }),
+  ]);
 
-  const elements: ElementConfigDTO[] = project.elements.map((el) => {
-    const variants: VariantDTO[] = el.variants.map((v) => ({
+  const elementIds = elementsData.map((el) => el._id);
+  const [variants, rules] = await Promise.all([
+    Variant.find({ elementId: { $in: elementIds } }),
+    Rule.find({ elementId: { $in: elementIds } }),
+  ]);
+
+  const audienceMap = new Map(audiences.map((a) => [a.id, a]));
+  const variantsByElement = new Map<string, typeof variants>();
+  const rulesByElement = new Map<string, typeof rules>();
+  for (const v of variants) {
+    const eid = String(v.elementId);
+    if (!variantsByElement.has(eid)) variantsByElement.set(eid, []);
+    variantsByElement.get(eid)!.push(v);
+  }
+  for (const r of rules) {
+    const eid = String(r.elementId);
+    if (!rulesByElement.has(eid)) rulesByElement.set(eid, []);
+    rulesByElement.get(eid)!.push(r);
+  }
+
+  const elements: ElementConfigDTO[] = elementsData.map((el) => {
+    const elVariants = variantsByElement.get(String(el._id)) ?? [];
+    const elRules = rulesByElement.get(String(el._id)) ?? [];
+    const variants: VariantDTO[] = elVariants.map((v) => ({
       id: v.id,
       name: v.name,
       mutations: v.mutations as unknown as VariantMutation[],
     }));
 
-    const rules: RuleDTO[] = el.rules.map((r) => {
+    const rules: RuleDTO[] = elRules.map((r) => {
       let conditions = r.conditions as unknown as Condition[];
       let logic = r.logic as "AND" | "OR";
 
       if (r.audienceId) {
-        const audience = audienceMap.get(r.audienceId);
+        const audience = audienceMap.get(String(r.audienceId));
         if (audience) {
           conditions = audience.conditions as unknown as Condition[];
           logic = audience.logic as "AND" | "OR";

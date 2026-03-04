@@ -3,7 +3,7 @@ import { z } from "zod";
 import { Webhook } from "standardwebhooks";
 import { requireAuth } from "../auth/middleware.js";
 import { requireProjectOwnership } from "../lib/ownership.js";
-import { prisma } from "../db/index.js";
+import { Integration, Visitor, CustomerEvent } from "../db/models.js";
 import { broadcast } from "../lib/websocket-hub.js";
 
 type Env = { Variables: { userId: string } };
@@ -19,12 +19,17 @@ integrations.get("/projects/:projectId/integrations", async (c) => {
   const projectId = c.req.param("projectId");
   await requireProjectOwnership(projectId, userId);
 
-  const items = await prisma.integration.findMany({
-    where: { projectId },
-    select: { id: true, type: true, enabled: true, createdAt: true, updatedAt: true },
-  });
+  const items = await Integration.find({ projectId }).select("_id type enabled createdAt updatedAt").lean();
 
-  return c.json({ integrations: items });
+  return c.json({
+    integrations: items.map((i) => ({
+      id: i._id.toString(),
+      type: i.type,
+      enabled: i.enabled,
+      createdAt: (i as any).createdAt?.toISOString?.() ?? null,
+      updatedAt: (i as any).updatedAt?.toISOString?.() ?? null,
+    })),
+  });
 });
 
 const polarConnectSchema = z.object({
@@ -42,19 +47,21 @@ integrations.post("/projects/:projectId/integrations/polar", async (c) => {
     return c.json({ error: parsed.error.flatten().fieldErrors }, 400);
   }
 
-  const integration = await prisma.integration.upsert({
-    where: { projectId_type: { projectId, type: "polar" } },
-    create: {
-      projectId,
-      type: "polar",
-      config: parsed.data,
-      enabled: true,
-    },
-    update: {
-      config: parsed.data,
-      enabled: true,
-    },
-  });
+  const createData = {
+    projectId,
+    type: "polar",
+    config: parsed.data,
+    enabled: true,
+  };
+  const updateData = {
+    config: parsed.data,
+    enabled: true,
+  };
+  const integration = await Integration.findOneAndUpdate(
+    { projectId, type: "polar" },
+    { $set: updateData, $setOnInsert: createData },
+    { upsert: true, returnDocument: "after" }
+  );
 
   return c.json({
     id: integration.id,
@@ -69,9 +76,7 @@ integrations.delete("/projects/:projectId/integrations/polar", async (c) => {
   const projectId = c.req.param("projectId");
   await requireProjectOwnership(projectId, userId);
 
-  await prisma.integration.deleteMany({
-    where: { projectId, type: "polar" },
-  });
+  await Integration.deleteMany({ projectId, type: "polar" });
 
   return c.json({ ok: true });
 });
@@ -85,9 +90,7 @@ export const polarWebhookHandler = new Hono();
 polarWebhookHandler.post("/webhooks/polar/:projectId", async (c) => {
   const projectId = c.req.param("projectId");
 
-  const integration = await prisma.integration.findUnique({
-    where: { projectId_type: { projectId, type: "polar" } },
-  });
+  const integration = await Integration.findOne({ projectId, type: "polar" });
 
   if (!integration || !integration.enabled) {
     return c.json({ error: "Integration not found" }, 404);
@@ -164,66 +167,58 @@ polarWebhookHandler.post("/webhooks/polar/:projectId", async (c) => {
     || null;
 
   if (metaVisitorId) {
-    const visitor = await prisma.visitor.findUnique({
-      where: { projectId_visitorId: { projectId, visitorId: metaVisitorId } },
-      select: { visitorId: true },
-    });
+    const visitor = await Visitor.findOne({ projectId, visitorId: metaVisitorId }).select("visitorId").lean();
     if (visitor) matchedVisitorId = visitor.visitorId;
   }
 
   if (!matchedVisitorId && customerEmail) {
-    const visitor = await prisma.visitor.findFirst({
-      where: { projectId, email: customerEmail.toLowerCase() },
-      select: { visitorId: true },
-    });
+    const visitor = await Visitor.findOne({ projectId, email: customerEmail.toLowerCase() })
+      .select("visitorId")
+      .lean();
     if (visitor) matchedVisitorId = visitor.visitorId;
   }
 
-  await prisma.customerEvent.create({
-    data: {
-      projectId,
-      visitorId: matchedVisitorId,
-      type: ceType,
-      amount,
-      currency,
-      productName,
-      customerEmail,
-      externalId,
-      provider: "polar",
-      metadata: data,
-    },
+  await CustomerEvent.create({
+    projectId,
+    visitorId: matchedVisitorId,
+    type: ceType,
+    amount,
+    currency,
+    productName,
+    customerEmail,
+    externalId,
+    provider: "polar",
+    metadata: data,
   });
 
   const customerName: string | null = data.customer?.name || null;
 
   // Update visitor with payment data and customer details
   if (matchedVisitorId && ceType === "purchase" && amount) {
-    const visitorUpdate: Record<string, unknown> = {
-      totalRevenue: { increment: amount },
-      polarCustomerId: data.customer?.id || undefined,
-    };
-    if (customerName) visitorUpdate.name = customerName;
-    if (customerEmail) visitorUpdate.email = customerEmail.toLowerCase();
+    const setFields: Record<string, unknown> = {};
+    if (customerName) setFields.name = customerName;
+    if (customerEmail) setFields.email = customerEmail.toLowerCase();
+    if (data.customer?.id) setFields.polarCustomerId = data.customer.id;
 
-    await prisma.visitor.update({
-      where: { projectId_visitorId: { projectId, visitorId: matchedVisitorId } },
-      data: visitorUpdate as any,
-    });
+    await Visitor.findOneAndUpdate(
+      { projectId, visitorId: matchedVisitorId },
+      {
+        $inc: { totalRevenue: amount },
+        ...(Object.keys(setFields).length > 0 && { $set: setFields }),
+      }
+    );
   } else if (matchedVisitorId && ceType === "refund" && amount) {
-    await prisma.visitor.update({
-      where: { projectId_visitorId: { projectId, visitorId: matchedVisitorId } },
-      data: { totalRevenue: { decrement: amount } },
-    });
+    await Visitor.findOneAndUpdate(
+      { projectId, visitorId: matchedVisitorId },
+      { $inc: { totalRevenue: -amount } }
+    );
   } else if (matchedVisitorId && (ceType === "subscription_created" || ceType === "subscription_canceled")) {
     const visitorUpdate: Record<string, unknown> = {};
     if (customerName) visitorUpdate.name = customerName;
     if (customerEmail) visitorUpdate.email = customerEmail.toLowerCase();
     if (data.customer?.id) visitorUpdate.polarCustomerId = data.customer.id;
     if (Object.keys(visitorUpdate).length > 0) {
-      await prisma.visitor.update({
-        where: { projectId_visitorId: { projectId, visitorId: matchedVisitorId } },
-        data: visitorUpdate as any,
-      });
+      await Visitor.findOneAndUpdate({ projectId, visitorId: matchedVisitorId }, visitorUpdate);
     }
   }
 

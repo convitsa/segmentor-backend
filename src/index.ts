@@ -23,7 +23,7 @@ import { requireAuth } from "./auth/middleware.js";
 import { requireSubscription } from "./auth/require-subscription.js";
 import { requireAdmin } from "./auth/require-admin.js";
 import { shutdownPosthog } from "./lib/posthog.js";
-import { prisma } from "./db/index.js";
+import { connectDB, mongoose } from "./db/mongoose.js";
 import { handleWsUpgrade, websocketHandler } from "./lib/websocket-hub.js";
 
 function validateEnv() {
@@ -156,7 +156,7 @@ app.onError((err, c) => {
 
 app.get("/health", async (c) => {
   try {
-    await prisma.$runCommandRaw({ ping: 1 });
+    await mongoose.connection.db!.admin().ping();
     return c.json({ status: "ok", db: "connected" });
   } catch {
     return c.json({ status: "degraded", db: "disconnected" }, 503);
@@ -164,13 +164,17 @@ app.get("/health", async (c) => {
 });
 
 process.on("SIGTERM", async () => {
+  await mongoose.disconnect();
   await shutdownPosthog();
   process.exit(0);
 });
 process.on("SIGINT", async () => {
+  await mongoose.disconnect();
   await shutdownPosthog();
   process.exit(0);
 });
+
+await connectDB();
 
 Bun.serve({
   port: PORT,

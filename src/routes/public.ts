@@ -1,7 +1,15 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { getProjectConfig } from "../services/configService.js";
-import { prisma } from "../db/index.js";
+import {
+  Project,
+  Event,
+  Visitor,
+  Session,
+  PageView,
+  TrackEvent,
+  CustomerEvent,
+} from "../db/models.js";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { lookup } from "mime-types";
@@ -79,14 +87,11 @@ pub.post("/track", async (c) => {
       return c.json({ ok: false, error: parsed.error.flatten().fieldErrors }, 400);
     }
     const body = parsed.data;
-    const project = await prisma.project.findUnique({
-      where: { publicKey: body.projectKey },
-      select: { id: true },
-    });
+    const project = await Project.findOne({ publicKey: body.projectKey });
     if (!project) return c.json({ ok: false }, 404);
 
-    await prisma.event.createMany({
-      data: body.events.map((e) => ({
+    await Event.insertMany(
+      body.events.map((e) => ({
         projectId: project.id,
         elementId: e.elementId,
         variantId: e.variantId,
@@ -97,8 +102,8 @@ pub.post("/track", async (c) => {
         country: e.country || null,
         countryCode: e.countryCode || null,
         device: e.device || null,
-      })),
-    });
+      }))
+    );
     return c.json({ ok: true });
   } catch {
     return c.json({ ok: false }, 500);
@@ -212,10 +217,7 @@ pub.post("/ingest", async (c) => {
       return c.json({ ok: false, error: parsed.error.flatten().fieldErrors }, 400);
     }
     const body = parsed.data;
-    const project = await prisma.project.findUnique({
-      where: { publicKey: body.projectKey },
-      select: { id: true },
-    });
+    const project = await Project.findOne({ publicKey: body.projectKey });
     if (!project) return c.json({ ok: false }, 404);
 
     const pid = project.id;
@@ -301,104 +303,105 @@ pub.post("/ingest", async (c) => {
     const ops: Promise<unknown>[] = [];
 
     // Upsert Visitor
-    const visitorUpdate: Record<string, unknown> = {
+    const visitorSet: Record<string, unknown> = {
       lastSeenAt: now,
-      totalPageviews: { increment: pvCount },
-      totalEvents: { increment: evtCount },
     };
-    if (geo.country) visitorUpdate.country = geo.country;
-    if (geo.countryCode) visitorUpdate.countryCode = geo.countryCode;
-    if (geo.region) visitorUpdate.region = geo.region;
-    if (geo.city) visitorUpdate.city = geo.city;
-    if (ctx.language) visitorUpdate.language = ctx.language;
-    if (ctx.device) visitorUpdate.device = ctx.device;
-    if (ctx.browser) visitorUpdate.browser = ctx.browser;
-    if (ctx.os) visitorUpdate.os = ctx.os;
-    if (identifyEmail) visitorUpdate.email = identifyEmail;
+    if (geo.country) visitorSet.country = geo.country;
+    if (geo.countryCode) visitorSet.countryCode = geo.countryCode;
+    if (geo.region) visitorSet.region = geo.region;
+    if (geo.city) visitorSet.city = geo.city;
+    if (ctx.language) visitorSet.language = ctx.language;
+    if (ctx.device) visitorSet.device = ctx.device;
+    if (ctx.browser) visitorSet.browser = ctx.browser;
+    if (ctx.os) visitorSet.os = ctx.os;
+    if (identifyEmail) visitorSet.email = identifyEmail;
 
     ops.push(
-      prisma.visitor.upsert({
-        where: { projectId_visitorId: { projectId: pid, visitorId: vid } },
-        create: {
-          projectId: pid, visitorId: vid,
-          name: identifyEmail ? null : friendlyName(vid),
-          isRandomName: !identifyEmail,
-          country: geo.country || null, countryCode: geo.countryCode || null,
-          region: geo.region || null, city: geo.city || null,
-          language: ctx.language || null, device: ctx.device || null,
-          browser: ctx.browser || null, os: ctx.os || null,
-          firstReferrer: ctx.referrer || null,
-          firstUtmSource: utm.source || null,
-          firstUtmMedium: utm.medium || null,
-          firstUtmCampaign: utm.campaign || null,
-          totalSessions: 1, totalPageviews: pvCount, totalEvents: evtCount,
-          email: identifyEmail, firstSeenAt: now, lastSeenAt: now,
+      Visitor.findOneAndUpdate(
+        { projectId: pid, visitorId: vid },
+        {
+          $set: visitorSet,
+          $inc: { totalPageviews: pvCount, totalEvents: evtCount },
+          $setOnInsert: {
+            projectId: pid,
+            visitorId: vid,
+            name: identifyEmail ? null : friendlyName(vid),
+            isRandomName: !identifyEmail,
+            firstReferrer: ctx.referrer || null,
+            firstUtmSource: utm.source || null,
+            firstUtmMedium: utm.medium || null,
+            firstUtmCampaign: utm.campaign || null,
+            totalSessions: 1,
+            firstSeenAt: now,
+          },
         },
-        update: visitorUpdate,
-      })
+        { upsert: true, returnDocument: "after" }
+      )
     );
 
     // Upsert Session
     ops.push(
-      prisma.session.upsert({
-        where: { projectId_sessionId: { projectId: pid, sessionId: sid } },
-        create: {
-          projectId: pid, visitorId: vid, sessionId: sid,
-          entryPage: firstPageUrl, exitPage: lastPageUrl,
-          referrer: ctx.referrer || null,
-          utmSource: utm.source || null, utmMedium: utm.medium || null,
-          utmCampaign: utm.campaign || null,
-          device: ctx.device || null, browser: ctx.browser || null,
-          os: ctx.os || null, country: geo.country || null,
-          countryCode: geo.countryCode || null,
-          pageviews: pvCount, events: evtCount,
-          startedAt: now, endedAt: now,
+      Session.findOneAndUpdate(
+        { projectId: pid, sessionId: sid },
+        {
+          $set: {
+            endedAt: now,
+            ...(lastPageUrl != null && { exitPage: lastPageUrl }),
+          },
+          $inc: { pageviews: pvCount, events: evtCount },
+          $setOnInsert: {
+            projectId: pid,
+            visitorId: vid,
+            sessionId: sid,
+            entryPage: firstPageUrl,
+            referrer: ctx.referrer || null,
+            utmSource: utm.source || null,
+            utmMedium: utm.medium || null,
+            utmCampaign: utm.campaign || null,
+            device: ctx.device || null,
+            browser: ctx.browser || null,
+            os: ctx.os || null,
+            country: geo.country || null,
+            countryCode: geo.countryCode || null,
+            startedAt: now,
+          },
         },
-        update: {
-          endedAt: now,
-          exitPage: lastPageUrl || undefined,
-          pageviews: { increment: pvCount },
-          events: { increment: evtCount },
-        },
-      })
+        { upsert: true, returnDocument: "after" }
+      )
     );
 
     if (pageviews.length > 0) {
-      ops.push(prisma.pageView.createMany({ data: pageviews }));
+      ops.push(PageView.insertMany(pageviews));
     }
     if (trackEvents.length > 0) {
-      ops.push(prisma.trackEvent.createMany({ data: trackEvents }));
+      ops.push(TrackEvent.insertMany(trackEvents));
     }
     if (impressions.length > 0) {
-      ops.push(prisma.event.createMany({ data: impressions }));
+      ops.push(Event.insertMany(impressions));
     }
 
     // Handle pageview_end updates (update most recent matching pageview)
-    for (const pu of pageviewEndUpdates) {
-      ops.push(
-        prisma.pageView.findFirst({
-          where: { projectId: pid, visitorId: vid, sessionId: sid, url: pu.url },
-          orderBy: { timestamp: "desc" },
-        }).then((pv) => {
-          if (!pv) return;
-          return prisma.pageView.update({
-            where: { id: pv.id },
-            data: {
-              duration: pu.duration ?? undefined,
-              scrollDepth: pu.scrollDepth ?? undefined,
-            },
-          });
-        })
-      );
-    }
+    ops.push(
+      ...pageviewEndUpdates.map((pu) => {
+        const set: Record<string, number> = {};
+        if (pu.duration != null) set.duration = pu.duration;
+        if (pu.scrollDepth != null) set.scrollDepth = pu.scrollDepth;
+        if (Object.keys(set).length === 0) return Promise.resolve();
+        return PageView.findOneAndUpdate(
+          { projectId: pid, visitorId: vid, sessionId: sid, url: pu.url },
+          { $set: set },
+          { sort: { timestamp: -1 } }
+        );
+      })
+    );
 
     // If identify, also link unlinked CustomerEvents
     if (identifyEmail) {
       ops.push(
-        prisma.customerEvent.updateMany({
-          where: { projectId: pid, customerEmail: identifyEmail, visitorId: null },
-          data: { visitorId: vid },
-        })
+        CustomerEvent.updateMany(
+          { projectId: pid, customerEmail: identifyEmail, visitorId: null },
+          { $set: { visitorId: vid } }
+        )
       );
     }
 
@@ -1053,10 +1056,9 @@ pub.get("/proxy", async (c) => {
     return c.text("projectKey is required", 400);
   }
 
-  const project = await prisma.project.findUnique({
-    where: { publicKey: projectKey },
-    select: { siteUrl: true },
-  });
+  const project = await Project.findOne({ publicKey: projectKey }).select(
+    "siteUrl"
+  );
 
   if (!project) {
     return c.text("Project not found", 404);

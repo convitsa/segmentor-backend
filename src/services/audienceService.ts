@@ -1,11 +1,8 @@
-import { prisma } from "../db/index.js";
+import { Audience } from "../db/models.js";
 import type { Condition } from "../types/dto.js";
 
 export async function listAudiences(projectId: string) {
-  return prisma.audience.findMany({
-    where: { projectId },
-    orderBy: { createdAt: "desc" },
-  });
+  return Audience.find({ projectId }).sort({ createdAt: -1 });
 }
 
 export async function createAudience(
@@ -16,13 +13,11 @@ export async function createAudience(
     logic: "AND" | "OR";
   }
 ) {
-  return prisma.audience.create({
-    data: {
-      projectId,
-      name: data.name,
-      conditions: data.conditions as any,
-      logic: data.logic,
-    },
+  return Audience.create({
+    projectId,
+    name: data.name,
+    conditions: data.conditions as any,
+    logic: data.logic,
   });
 }
 
@@ -38,9 +33,9 @@ export async function updateAudience(
   if (data.name !== undefined) updateData.name = data.name;
   if (data.conditions !== undefined) updateData.conditions = data.conditions as any;
   if (data.logic !== undefined) updateData.logic = data.logic;
-  return prisma.audience.update({ where: { id }, data: updateData });
+  return Audience.findByIdAndUpdate(id, updateData, { returnDocument: "after" });
 }
 
 export async function deleteAudience(id: string) {
-  return prisma.audience.delete({ where: { id } });
+  return Audience.findByIdAndDelete(id);
 }

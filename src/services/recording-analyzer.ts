@@ -1,4 +1,4 @@
-import { prisma } from "../db/index.js";
+import { SessionRecording, Visitor } from "../db/models.js";
 import { AzureOpenAI } from "openai";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
@@ -120,17 +120,12 @@ function getOpenAIClient(): AzureOpenAI | null {
 }
 
 export async function analyzeRecording(recordingId: string): Promise<void> {
-  const rec = await prisma.sessionRecording.findUnique({
-    where: { id: recordingId },
-  });
+  const rec = await SessionRecording.findById(recordingId);
   if (!rec || !rec.eventsFile) {
     throw new Error("Recording not found or has no events file");
   }
 
-  await prisma.sessionRecording.update({
-    where: { id: recordingId },
-    data: { status: "analyzing" },
-  });
+  await SessionRecording.findByIdAndUpdate(recordingId, { status: "analyzing" }, { returnDocument: "after" });
 
   try {
     const eventsPath = join(UPLOADS_DIR, rec.eventsFile);
@@ -142,16 +137,15 @@ export async function analyzeRecording(recordingId: string): Promise<void> {
     const structuredEvents = extractStructuredEvents(rawEvents);
 
     // Get visitor context
-    const visitor = await prisma.visitor.findFirst({
-      where: { projectId: rec.projectId, visitorId: rec.visitorId },
-      select: { country: true, countryCode: true, city: true, device: true, browser: true, os: true, firstReferrer: true, firstUtmSource: true, email: true, name: true },
-    });
+    const visitor = await Visitor.findOne({ projectId: rec.projectId, visitorId: rec.visitorId }).select(
+      "country countryCode city device browser os firstReferrer firstUtmSource email name"
+    );
 
     const client = getOpenAIClient();
     if (!client) {
-      await prisma.sessionRecording.update({
-        where: { id: recordingId },
-        data: {
+      await SessionRecording.findByIdAndUpdate(
+        recordingId,
+        {
           status: "analyzed",
           summary: "AI analysis unavailable - structured events extracted successfully.",
           journeySteps: structuredEvents.filter((e) => e.type === "page") as any,
@@ -160,7 +154,8 @@ export async function analyzeRecording(recordingId: string): Promise<void> {
           sentiment: "neutral",
           analyzedAt: new Date(),
         },
-      });
+        { returnDocument: "after" }
+      );
       return;
     }
 
@@ -222,9 +217,9 @@ Respond with ONLY valid JSON (no markdown, no code fences) in this exact format:
       };
     }
 
-    await prisma.sessionRecording.update({
-      where: { id: recordingId },
-      data: {
+    await SessionRecording.findByIdAndUpdate(
+      recordingId,
+      {
         status: "analyzed",
         summary: analysis.summary || "Analysis complete",
         journeySteps: analysis.journeySteps || [],
@@ -234,14 +229,12 @@ Respond with ONLY valid JSON (no markdown, no code fences) in this exact format:
         sentiment: analysis.sentiment || "neutral",
         analyzedAt: new Date(),
       },
-    });
+      { returnDocument: "after" }
+    );
 
     console.log(`[Recording] Analysis complete for ${recordingId}`);
   } catch (err: any) {
     console.error(`[Recording] Analysis failed for ${recordingId}:`, err?.message || err);
-    await prisma.sessionRecording.update({
-      where: { id: recordingId },
-      data: { status: "failed" },
-    });
+    await SessionRecording.findByIdAndUpdate(recordingId, { status: "failed" }, { returnDocument: "after" });
   }
 }

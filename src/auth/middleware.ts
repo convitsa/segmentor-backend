@@ -1,7 +1,7 @@
 import { createMiddleware } from "hono/factory";
 import { HTTPException } from "hono/http-exception";
 import { verifyToken } from "./jwt.js";
-import { prisma } from "../db/index.js";
+import { User } from "../db/models.js";
 
 type Env = {
   Variables: {
@@ -24,10 +24,7 @@ export const requireAuth = createMiddleware<Env>(async (c, next) => {
     throw new HTTPException(401, { message: "Invalid or expired token" });
   }
 
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { id: true },
-  });
+  const user = await User.findById(userId);
   if (!user) {
     throw new HTTPException(401, { message: "User no longer exists" });
   }

@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import Stripe from "stripe";
-import { prisma } from "../db/index.js";
+import { User, Plan, Subscription } from "../db/models.js";
 import { requireAuth } from "../auth/middleware.js";
 import { fireEmail } from "../email/send.js";
 import {
@@ -27,10 +27,7 @@ const billing = new Hono<AuthEnv>();
 // ─── Public: list active plans ───
 
 billing.get("/plans", async (c) => {
-  const plans = await prisma.plan.findMany({
-    where: { active: true },
-    orderBy: { monthlyPrice: "asc" },
-  });
+  const plans = await Plan.find({ active: true }).sort({ monthlyPrice: 1 });
 
   return c.json(
     plans.map((p) => ({
@@ -49,12 +46,12 @@ billing.get("/plans", async (c) => {
 billing.get("/subscription", requireAuth, async (c) => {
   const userId = c.get("userId");
 
-  const sub = await prisma.subscription.findUnique({ where: { userId } });
+  const sub = await Subscription.findOne({ userId });
   if (!sub) {
     return c.json({ subscription: null });
   }
 
-  const plan = await prisma.plan.findUnique({ where: { id: sub.planId } });
+  const plan = await Plan.findById(sub.planId);
 
   return c.json({
     subscription: {
@@ -88,12 +85,12 @@ billing.post("/checkout", requireAuth, async (c) => {
 
   const { planId, interval } = parsed.data;
 
-  const plan = await prisma.plan.findUnique({ where: { id: planId } });
+  const plan = await Plan.findById(planId);
   if (!plan || !plan.active) {
     return c.json({ error: "Plan not found" }, 404);
   }
 
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const user = await User.findById(userId);
   if (!user) return c.json({ error: "User not found" }, 404);
 
   let customerId = user.stripeCustomerId;
@@ -103,10 +100,7 @@ billing.post("/checkout", requireAuth, async (c) => {
       metadata: { userId: user.id },
     });
     customerId = customer.id;
-    await prisma.user.update({
-      where: { id: userId },
-      data: { stripeCustomerId: customerId },
-    });
+    await User.findByIdAndUpdate(userId, { stripeCustomerId: customerId });
   }
 
   const priceId = interval === "year" ? plan.stripePriceIdYearly : plan.stripePriceIdMonthly;
@@ -128,7 +122,7 @@ billing.post("/checkout", requireAuth, async (c) => {
 
 billing.post("/portal", requireAuth, async (c) => {
   const userId = c.get("userId");
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const user = await User.findById(userId);
   if (!user?.stripeCustomerId) {
     return c.json({ error: "No billing account found" }, 400);
   }
@@ -183,33 +177,35 @@ billing.post("/webhook", async (c) => {
       const periodStart = item ? new Date(item.current_period_start * 1000) : new Date();
       const periodEnd = item ? new Date(item.current_period_end * 1000) : new Date();
 
-      await prisma.subscription.upsert({
-        where: { userId },
-        create: {
-          userId,
-          planId,
-          stripeSubscriptionId: stripeSub.id,
-          stripeCustomerId: stripeSub.customer as string,
-          status: stripeSub.status,
-          interval,
-          currentPeriodStart: periodStart,
-          currentPeriodEnd: periodEnd,
-          cancelAtPeriodEnd: stripeSub.cancel_at_period_end,
-        },
-        update: {
-          planId,
-          stripeSubscriptionId: stripeSub.id,
-          stripeCustomerId: stripeSub.customer as string,
-          status: stripeSub.status,
-          interval,
-          currentPeriodStart: periodStart,
-          currentPeriodEnd: periodEnd,
-          cancelAtPeriodEnd: stripeSub.cancel_at_period_end,
-        },
-      });
+      const createData = {
+        userId,
+        planId,
+        stripeSubscriptionId: stripeSub.id,
+        stripeCustomerId: stripeSub.customer as string,
+        status: stripeSub.status,
+        interval,
+        currentPeriodStart: periodStart,
+        currentPeriodEnd: periodEnd,
+        cancelAtPeriodEnd: stripeSub.cancel_at_period_end,
+      };
+      const updateData = {
+        planId,
+        stripeSubscriptionId: stripeSub.id,
+        stripeCustomerId: stripeSub.customer as string,
+        status: stripeSub.status,
+        interval,
+        currentPeriodStart: periodStart,
+        currentPeriodEnd: periodEnd,
+        cancelAtPeriodEnd: stripeSub.cancel_at_period_end,
+      };
+      await Subscription.findOneAndUpdate(
+        { userId },
+        { $set: updateData, $setOnInsert: createData },
+        { upsert: true, returnDocument: "after" }
+      );
 
-      const checkoutUser = await prisma.user.findUnique({ where: { id: userId } });
-      const checkoutPlan = await prisma.plan.findUnique({ where: { id: planId } });
+      const checkoutUser = await User.findById(userId);
+      const checkoutPlan = await Plan.findById(planId);
       if (checkoutUser && checkoutPlan) {
         const amount = interval === "year" ? checkoutPlan.yearlyPrice : checkoutPlan.monthlyPrice;
         const tpl = subscriptionCreatedEmail(checkoutPlan.name, interval, amount);
@@ -221,22 +217,15 @@ billing.post("/webhook", async (c) => {
 
     case "customer.subscription.updated": {
       const sub = event.data.object as Stripe.Subscription;
-      const existing = await prisma.subscription.findUnique({
-        where: { stripeSubscriptionId: sub.id },
-      });
+      const existing = await Subscription.findOne({ stripeSubscriptionId: sub.id });
       if (!existing) break;
 
       const subItem = sub.items.data[0];
       const priceId = subItem?.price?.id;
       let interval = existing.interval;
       if (priceId) {
-        const plan = await prisma.plan.findFirst({
-          where: {
-            OR: [
-              { stripePriceIdMonthly: priceId },
-              { stripePriceIdYearly: priceId },
-            ],
-          },
+        const plan = await Plan.findOne({
+          $or: [{ stripePriceIdMonthly: priceId }, { stripePriceIdYearly: priceId }],
         });
         if (plan) {
           interval = priceId === plan.stripePriceIdYearly ? "year" : "month";
@@ -246,26 +235,29 @@ billing.post("/webhook", async (c) => {
       const updPeriodStart = subItem ? new Date(subItem.current_period_start * 1000) : undefined;
       const updPeriodEnd = subItem ? new Date(subItem.current_period_end * 1000) : undefined;
 
-      await prisma.subscription.update({
-        where: { stripeSubscriptionId: sub.id },
-        data: {
-          status: sub.status,
-          interval,
-          ...(updPeriodStart && { currentPeriodStart: updPeriodStart }),
-          ...(updPeriodEnd && { currentPeriodEnd: updPeriodEnd }),
-          cancelAtPeriodEnd: sub.cancel_at_period_end,
-        },
-      });
+      const updatePayload: Record<string, unknown> = {
+        status: sub.status,
+        interval,
+        cancelAtPeriodEnd: sub.cancel_at_period_end,
+      };
+      if (updPeriodStart) updatePayload.currentPeriodStart = updPeriodStart;
+      if (updPeriodEnd) updatePayload.currentPeriodEnd = updPeriodEnd;
 
-      const updUser = await prisma.user.findUnique({ where: { id: existing.userId } });
+      await Subscription.findOneAndUpdate({ stripeSubscriptionId: sub.id }, updatePayload, { returnDocument: "after" });
+
+      const updUser = await User.findById(existing.userId);
       if (updUser && priceId) {
-        const updPlan = await prisma.plan.findFirst({
-          where: { OR: [{ stripePriceIdMonthly: priceId }, { stripePriceIdYearly: priceId }] },
+        const updPlan = await Plan.findOne({
+          $or: [{ stripePriceIdMonthly: priceId }, { stripePriceIdYearly: priceId }],
         });
         if (updPlan) {
           const tpl = subscriptionUpdatedEmail(updPlan.name, interval);
           fireEmail(updUser.email, tpl.subject, tpl.html);
-          captureEvent(existing.userId, "subscription_updated", { plan: updPlan.name, interval, status: sub.status });
+          captureEvent(existing.userId.toString(), "subscription_updated", {
+            plan: updPlan.name,
+            interval,
+            status: sub.status,
+          });
         }
       }
       break;
@@ -273,18 +265,15 @@ billing.post("/webhook", async (c) => {
 
     case "customer.subscription.deleted": {
       const sub = event.data.object as Stripe.Subscription;
-      const canceledSub = await prisma.subscription.findUnique({
-        where: { stripeSubscriptionId: sub.id },
-        include: { user: true },
-      });
-      await prisma.subscription.updateMany({
-        where: { stripeSubscriptionId: sub.id },
-        data: { status: "canceled" },
-      });
-      if (canceledSub?.user) {
-        const tpl = subscriptionCanceledEmail();
-        fireEmail(canceledSub.user.email, tpl.subject, tpl.html);
-        captureEvent(canceledSub.userId, "subscription_canceled");
+      const canceledSub = await Subscription.findOne({ stripeSubscriptionId: sub.id });
+      await Subscription.updateMany({ stripeSubscriptionId: sub.id }, { status: "canceled" });
+      if (canceledSub) {
+        const canceledUser = await User.findById(canceledSub.userId);
+        if (canceledUser) {
+          const tpl = subscriptionCanceledEmail();
+          fireEmail(canceledUser.email, tpl.subject, tpl.html);
+          captureEvent(canceledSub.userId.toString(), "subscription_canceled");
+        }
       }
       break;
     }
@@ -294,18 +283,15 @@ billing.post("/webhook", async (c) => {
       const subRef = invoice.parent?.subscription_details?.subscription;
       const subId = typeof subRef === "string" ? subRef : subRef?.id;
       if (subId) {
-        const failedSub = await prisma.subscription.findUnique({
-          where: { stripeSubscriptionId: subId },
-          include: { user: true },
-        });
-        await prisma.subscription.updateMany({
-          where: { stripeSubscriptionId: subId },
-          data: { status: "past_due" },
-        });
-        if (failedSub?.user) {
-          const tpl = paymentFailedEmail();
-          fireEmail(failedSub.user.email, tpl.subject, tpl.html);
-          captureEvent(failedSub.userId, "payment_failed");
+        const failedSub = await Subscription.findOne({ stripeSubscriptionId: subId });
+        await Subscription.updateMany({ stripeSubscriptionId: subId }, { status: "past_due" });
+        if (failedSub) {
+          const failedUser = await User.findById(failedSub.userId);
+          if (failedUser) {
+            const tpl = paymentFailedEmail();
+            fireEmail(failedUser.email, tpl.subject, tpl.html);
+            captureEvent(failedSub.userId.toString(), "payment_failed");
+          }
         }
       }
       break;

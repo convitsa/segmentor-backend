@@ -1,7 +1,16 @@
 import { Hono } from "hono";
+import mongoose from "mongoose";
 import { requireAuth } from "../auth/middleware.js";
 import { requireProjectOwnership } from "../lib/ownership.js";
-import { prisma } from "../db/index.js";
+import {
+  Visitor,
+  Session,
+  PageView,
+  TrackEvent,
+  Event,
+  CustomerEvent,
+  SavedSegment,
+} from "../db/models.js";
 import { AzureOpenAI } from "openai";
 
 type Env = { Variables: { userId: string } };
@@ -50,11 +59,11 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
   const where: Record<string, unknown> = { projectId };
 
   if (search) {
-    where.OR = [
-      { email: { contains: search, mode: "insensitive" } },
-      { visitorId: { contains: search } },
-      { city: { contains: search, mode: "insensitive" } },
-      { name: { contains: search, mode: "insensitive" } },
+    where.$or = [
+      { email: { $regex: search, $options: "i" } },
+      { visitorId: { $regex: search } },
+      { city: { $regex: search, $options: "i" } },
+      { name: { $regex: search, $options: "i" } },
     ];
   }
   if (filterCountry) {
@@ -64,73 +73,72 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
     where.device = filterDevice.toLowerCase();
   }
   if (filterBrowser) {
-    where.browser = { contains: filterBrowser, mode: "insensitive" };
+    where.browser = { $regex: filterBrowser, $options: "i" };
   }
   if (filterOs) {
-    where.os = { contains: filterOs, mode: "insensitive" };
+    where.os = { $regex: filterOs, $options: "i" };
   }
   if (filterLanguage) {
-    where.language = { contains: filterLanguage, mode: "insensitive" };
+    where.language = { $regex: filterLanguage, $options: "i" };
   }
   if (filterIdentified === "true") {
-    where.email = { not: null };
+    where.email = { $ne: null };
   } else if (filterIdentified === "false") {
     where.email = null;
   }
   if (filterHasRevenue === "true") {
-    where.totalRevenue = { gt: 0 };
+    where.totalRevenue = { $gt: 0 };
   }
   if (filterLive === "true") {
-    where.lastSeenAt = { gte: new Date(Date.now() - 5 * 60 * 1000) };
+    where.lastSeenAt = { $gte: new Date(Date.now() - 5 * 60 * 1000) };
   }
   if (filterUtmSource) {
-    where.firstUtmSource = { contains: filterUtmSource, mode: "insensitive" };
+    where.firstUtmSource = { $regex: filterUtmSource, $options: "i" };
   }
   if (filterUtmMedium) {
-    where.firstUtmMedium = { contains: filterUtmMedium, mode: "insensitive" };
+    where.firstUtmMedium = { $regex: filterUtmMedium, $options: "i" };
   }
   if (filterUtmCampaign) {
-    where.firstUtmCampaign = { contains: filterUtmCampaign, mode: "insensitive" };
+    where.firstUtmCampaign = { $regex: filterUtmCampaign, $options: "i" };
   }
   if (filterReferrer) {
-    where.firstReferrer = { contains: filterReferrer, mode: "insensitive" };
+    where.firstReferrer = { $regex: filterReferrer, $options: "i" };
   }
   if (filterTag) {
-    where.tags = { has: filterTag };
+    where.tags = filterTag;
   }
   if (filterSeenAfter || filterSeenBefore) {
     const lastSeenFilter: Record<string, Date> = {};
-    if (filterSeenAfter) lastSeenFilter.gte = new Date(filterSeenAfter);
-    if (filterSeenBefore) lastSeenFilter.lte = new Date(filterSeenBefore);
-    if (!where.lastSeenAt) where.lastSeenAt = lastSeenFilter;
+    if (filterSeenAfter) lastSeenFilter.$gte = new Date(filterSeenAfter);
+    if (filterSeenBefore) lastSeenFilter.$lte = new Date(filterSeenBefore);
+    if (Object.keys(lastSeenFilter).length) where.lastSeenAt = lastSeenFilter;
   }
   if (filterVisitorIds) {
-    where.visitorId = { in: filterVisitorIds.split(",") };
+    where.visitorId = { $in: filterVisitorIds.split(",") };
   }
 
   const allowedSorts = ["lastSeenAt", "firstSeenAt", "totalPageviews", "totalSessions", "totalRevenue", "totalEvents", "email"];
   const orderField = allowedSorts.includes(sortBy) ? sortBy : "lastSeenAt";
+  const mongoSort = { [orderField]: sortOrder === "asc" ? 1 : -1 } as Record<string, 1 | -1>;
 
-  const projectWhere = { projectId };
+  const projectOid = new mongoose.Types.ObjectId(projectId);
 
   const [items, total, aggregates] = await Promise.all([
-    prisma.visitor.findMany({
-      where: where as any,
-      orderBy: { [orderField]: sortOrder },
-      skip,
-      take: limit,
-    }),
-    prisma.visitor.count({ where: where as any }),
-    prisma.visitor.aggregate({
-      where: projectWhere,
-      _sum: { totalRevenue: true },
-      _count: { _all: true },
-    }),
+    Visitor.find(where).sort(mongoSort).skip(skip).limit(limit),
+    Visitor.countDocuments(where),
+    Visitor.aggregate([
+      { $match: { projectId: projectOid } },
+      { $group: { _id: null, totalRevenue: { $sum: "$totalRevenue" }, count: { $sum: 1 } } },
+    ]),
   ]);
 
+  const agg = aggregates[0];
+  const aggTotalRevenue = agg?.totalRevenue ?? 0;
+  const aggCount = agg?.count ?? 0;
+
   const [identifiedCount, paidCount] = await Promise.all([
-    prisma.visitor.count({ where: { projectId, email: { not: null } } }),
-    prisma.visitor.count({ where: { projectId, totalRevenue: { gt: 0 } } }),
+    Visitor.countDocuments({ projectId, email: { $ne: null } }),
+    Visitor.countDocuments({ projectId, totalRevenue: { $gt: 0 } }),
   ]);
 
   return c.json({
@@ -142,10 +150,10 @@ visitors.get("/projects/:projectId/visitors", async (c) => {
       totalPages: Math.ceil(total / limit),
     },
     stats: {
-      totalVisitors: aggregates._count._all,
+      totalVisitors: aggCount,
       identifiedVisitors: identifiedCount,
       paidVisitors: paidCount,
-      totalRevenue: aggregates._sum.totalRevenue ?? 0,
+      totalRevenue: aggTotalRevenue,
     },
   });
 });
@@ -156,38 +164,45 @@ visitors.get("/projects/:projectId/visitors/filters", async (c) => {
   const projectId = c.req.param("projectId");
   await requireProjectOwnership(projectId, userId);
 
-  const all = await prisma.visitor.findMany({
-    where: { projectId },
-    select: {
-      countryCode: true,
-      country: true,
-      language: true,
-      browser: true,
-      os: true,
-      device: true,
-      firstReferrer: true,
-      firstUtmSource: true,
-      firstUtmMedium: true,
-      firstUtmCampaign: true,
-      tags: true,
+  const filterOptions = await Visitor.aggregate([
+    { $match: { projectId: new mongoose.Types.ObjectId(projectId) } },
+    {
+      $facet: {
+        countries: [
+          { $group: { _id: { code: "$countryCode", name: "$country" } } },
+          { $match: { "_id.code": { $exists: true, $ne: null } } },
+          { $sort: { "_id.name": 1 } },
+        ],
+        languages: [{ $group: { _id: "$language" } }, { $match: { _id: { $ne: null } } }, { $sort: { _id: 1 } }],
+        browsers: [{ $group: { _id: "$browser" } }, { $match: { _id: { $ne: null } } }, { $sort: { _id: 1 } }],
+        oses: [{ $group: { _id: "$os" } }, { $match: { _id: { $ne: null } } }, { $sort: { _id: 1 } }],
+        devices: [{ $group: { _id: "$device" } }, { $match: { _id: { $ne: null } } }, { $sort: { _id: 1 } }],
+        referrers: [{ $group: { _id: "$firstReferrer" } }, { $match: { _id: { $ne: null } } }, { $sort: { _id: 1 } }],
+        utmSources: [{ $group: { _id: "$firstUtmSource" } }, { $match: { _id: { $ne: null } } }, { $sort: { _id: 1 } }],
+        utmMediums: [{ $group: { _id: "$firstUtmMedium" } }, { $match: { _id: { $ne: null } } }, { $sort: { _id: 1 } }],
+        utmCampaigns: [{ $group: { _id: "$firstUtmCampaign" } }, { $match: { _id: { $ne: null } } }, { $sort: { _id: 1 } }],
+        tags: [{ $unwind: "$tags" }, { $group: { _id: "$tags" } }, { $match: { _id: { $ne: null } } }, { $sort: { _id: 1 } }],
+      },
     },
-  });
+  ]);
 
-  function distinct(arr: (string | null | undefined)[]): string[] {
-    return [...new Set(arr.filter((v): v is string => !!v))].sort();
-  }
+  const facet = filterOptions[0] ?? {};
+  const mapStr = (arr: { _id: unknown }[]) => [...new Set(arr.map((x) => String(x._id)).filter(Boolean))].sort();
+  const mapCountries = (arr: { _id: { code?: string; name?: string } }[]) =>
+    [...new Set(arr.map((x) => (x._id?.code ? `${x._id.code}|${x._id.name || x._id.code}` : null)).filter(Boolean))].sort() as string[];
+  const mapTags = (arr: { _id: unknown }[]) => [...new Set(arr.map((x) => String(x._id)).filter(Boolean))].sort();
 
   return c.json({
-    countries: distinct(all.map((v) => v.countryCode ? `${v.countryCode}|${v.country || v.countryCode}` : null)),
-    languages: distinct(all.map((v) => v.language)),
-    browsers: distinct(all.map((v) => v.browser)),
-    os: distinct(all.map((v) => v.os)),
-    devices: distinct(all.map((v) => v.device)),
-    referrers: distinct(all.map((v) => v.firstReferrer)),
-    utmSources: distinct(all.map((v) => v.firstUtmSource)),
-    utmMediums: distinct(all.map((v) => v.firstUtmMedium)),
-    utmCampaigns: distinct(all.map((v) => v.firstUtmCampaign)),
-    tags: distinct(all.flatMap((v) => v.tags)),
+    countries: mapCountries(facet.countries ?? []),
+    languages: mapStr(facet.languages ?? []),
+    browsers: mapStr(facet.browsers ?? []),
+    os: mapStr(facet.oses ?? []),
+    devices: mapStr(facet.devices ?? []),
+    referrers: mapStr(facet.referrers ?? []),
+    utmSources: mapStr(facet.utmSources ?? []),
+    utmMediums: mapStr(facet.utmMediums ?? []),
+    utmCampaigns: mapStr(facet.utmCampaigns ?? []),
+    tags: mapTags(facet.tags ?? []),
   });
 });
 
@@ -198,23 +213,14 @@ visitors.get("/projects/:projectId/visitors/:visitorId", async (c) => {
   const visitorId = c.req.param("visitorId");
   await requireProjectOwnership(projectId, userId);
 
-  const visitor = await prisma.visitor.findUnique({
-    where: { projectId_visitorId: { projectId, visitorId } },
-  });
+  const visitor = await Visitor.findOne({ projectId, visitorId });
 
   if (!visitor) return c.json({ error: "Visitor not found" }, 404);
 
-  const recentSessions = await prisma.session.findMany({
-    where: { projectId, visitorId },
-    orderBy: { startedAt: "desc" },
-    take: 10,
-  });
-
-  const purchases = await prisma.customerEvent.findMany({
-    where: { projectId, visitorId },
-    orderBy: { timestamp: "desc" },
-    take: 20,
-  });
+  const [recentSessions, purchases] = await Promise.all([
+    Session.find({ projectId, visitorId }).sort({ startedAt: -1 }).limit(10),
+    CustomerEvent.find({ projectId, visitorId }).sort({ timestamp: -1 }).limit(20),
+  ]);
 
   return c.json({ visitor, recentSessions, purchases });
 });
@@ -231,22 +237,10 @@ visitors.get("/projects/:projectId/visitors/:visitorId/timeline", async (c) => {
   const skip = (page - 1) * limit;
 
   const [pageviews, trackEvents, impressions, customerEvents] = await Promise.all([
-    prisma.pageView.findMany({
-      where: { projectId, visitorId },
-      orderBy: { timestamp: "desc" },
-    }),
-    prisma.trackEvent.findMany({
-      where: { projectId, visitorId },
-      orderBy: { timestamp: "desc" },
-    }),
-    prisma.event.findMany({
-      where: { projectId, visitorId },
-      orderBy: { timestamp: "desc" },
-    }),
-    prisma.customerEvent.findMany({
-      where: { projectId, visitorId },
-      orderBy: { timestamp: "desc" },
-    }),
+    PageView.find({ projectId, visitorId }).sort({ timestamp: -1 }).limit(500),
+    TrackEvent.find({ projectId, visitorId }).sort({ timestamp: -1 }).limit(500),
+    Event.find({ projectId, visitorId }).sort({ timestamp: -1 }).limit(200),
+    CustomerEvent.find({ projectId, visitorId }).sort({ timestamp: -1 }).limit(200),
   ]);
 
   type TimelineEntry = {
@@ -321,13 +315,8 @@ visitors.get("/projects/:projectId/visitors/:visitorId/sessions", async (c) => {
   const skip = (page - 1) * limit;
 
   const [sessions, total] = await Promise.all([
-    prisma.session.findMany({
-      where: { projectId, visitorId },
-      orderBy: { startedAt: "desc" },
-      skip,
-      take: limit,
-    }),
-    prisma.session.count({ where: { projectId, visitorId } }),
+    Session.find({ projectId, visitorId }).sort({ startedAt: -1 }).skip(skip).limit(limit),
+    Session.countDocuments({ projectId, visitorId }),
   ]);
 
   return c.json({
@@ -347,13 +336,8 @@ visitors.get("/projects/:projectId/sessions", async (c) => {
   const skip = (page - 1) * limit;
 
   const [sessions, total] = await Promise.all([
-    prisma.session.findMany({
-      where: { projectId },
-      orderBy: { startedAt: "desc" },
-      skip,
-      take: limit,
-    }),
-    prisma.session.count({ where: { projectId } }),
+    Session.find({ projectId }).sort({ startedAt: -1 }).skip(skip).limit(limit),
+    Session.countDocuments({ projectId }),
   ]);
 
   return c.json({
@@ -376,50 +360,49 @@ visitors.post("/projects/:projectId/visitors/ai-search", async (c) => {
   const client = getOpenAIClient();
   if (!client) return c.json({ error: "AI search is not configured" }, 503);
 
-  const [allVisitors, eventNamesRaw, topPagesRaw] = await Promise.all([
-    prisma.visitor.findMany({
-      where: { projectId },
-      select: {
-        countryCode: true, country: true, language: true, browser: true,
-        os: true, device: true, firstReferrer: true, firstUtmSource: true,
-        firstUtmMedium: true, firstUtmCampaign: true, tags: true,
+  const [allVisitorsAgg, eventNamesRaw, topPagesRaw] = await Promise.all([
+    Visitor.aggregate([
+      { $match: { projectId: new mongoose.Types.ObjectId(projectId) } },
+      {
+        $facet: {
+          countries: [{ $group: { _id: { code: "$countryCode", name: "$country" } } }],
+          languages: [{ $group: { _id: "$language" } }],
+          browsers: [{ $group: { _id: "$browser" } }],
+          os: [{ $group: { _id: "$os" } }],
+          devices: [{ $group: { _id: "$device" } }],
+          referrers: [{ $group: { _id: "$firstReferrer" } }],
+          utmSources: [{ $group: { _id: "$firstUtmSource" } }],
+          utmMediums: [{ $group: { _id: "$firstUtmMedium" } }],
+          utmCampaigns: [{ $group: { _id: "$firstUtmCampaign" } }],
+          tags: [{ $unwind: "$tags" }, { $group: { _id: "$tags" } }],
+        },
       },
-    }),
-    prisma.trackEvent.findMany({
-      where: { projectId },
-      distinct: ["name"],
-      select: { name: true },
-      take: 100,
-    }),
-    prisma.pageView.findMany({
-      where: { projectId },
-      distinct: ["url"],
-      select: { url: true },
-      take: 100,
-    }),
+    ]),
+    TrackEvent.aggregate([
+      { $match: { projectId: new mongoose.Types.ObjectId(projectId) } },
+      { $group: { _id: "$name" } },
+      { $limit: 100 },
+    ]),
+    PageView.aggregate([
+      { $match: { projectId: new mongoose.Types.ObjectId(projectId) } },
+      { $group: { _id: "$url" } },
+      { $limit: 100 },
+    ]),
   ]);
 
-  function distinct(arr: (string | null | undefined)[]): string[] {
-    return [...new Set(arr.filter((v): v is string => !!v))].sort();
-  }
+  const eventNames = eventNamesRaw.map((e: { _id: string }) => e._id).filter(Boolean).sort();
+  const pageUrls = topPagesRaw.map((p: { _id: string }) => p._id).filter(Boolean).sort();
 
-  const eventNames = eventNamesRaw.map((e: any) => e.name as string).filter(Boolean).sort();
-  const pageUrls = topPagesRaw.map((p: any) => p.url as string).filter(Boolean).sort();
+  const facet = allVisitorsAgg[0] ?? {};
+  const mapStr = (arr: { _id: unknown }[]) => [...new Set(arr.map((x) => String(x._id)).filter(Boolean))].sort();
+  const mapCountries = (arr: { _id: { code?: string; name?: string } }[]) =>
+    [...new Set(arr.map((x) => (x._id?.code ? `${x._id.code} (${x._id.name || x._id.code})` : null)).filter(Boolean))].sort() as string[];
+  const mapTags = (arr: { _id: unknown }[]) => [...new Set(arr.map((x) => String(x._id)).filter(Boolean))].sort();
 
   // Fetch distinct click labels (properties.text) and form IDs for richer context
   const [recentClicks, recentForms] = await Promise.all([
-    prisma.trackEvent.findMany({
-      where: { projectId, name: "click" },
-      select: { properties: true },
-      take: 500,
-      orderBy: { timestamp: "desc" },
-    }),
-    prisma.trackEvent.findMany({
-      where: { projectId, name: "form_submit" },
-      select: { properties: true },
-      take: 200,
-      orderBy: { timestamp: "desc" },
-    }),
+    TrackEvent.find({ projectId, name: "click" }).select("properties").sort({ timestamp: -1 }).limit(500).lean(),
+    TrackEvent.find({ projectId, name: "form_submit" }).select("properties").sort({ timestamp: -1 }).limit(200).lean(),
   ]);
   const clickLabels = [...new Set(
     recentClicks.map((e: any) => (e.properties as any)?.text).filter(Boolean)
@@ -429,22 +412,22 @@ visitors.post("/projects/:projectId/visitors/ai-search", async (c) => {
   )].sort() as string[];
 
   const filterOptions = {
-    countries: distinct(allVisitors.map((v: any) => v.countryCode ? `${v.countryCode} (${v.country || v.countryCode})` : null)),
-    languages: distinct(allVisitors.map((v: any) => v.language)),
-    browsers: distinct(allVisitors.map((v: any) => v.browser)),
-    os: distinct(allVisitors.map((v: any) => v.os)),
-    devices: distinct(allVisitors.map((v: any) => v.device)),
-    referrers: distinct(allVisitors.map((v: any) => v.firstReferrer)),
-    utmSources: distinct(allVisitors.map((v: any) => v.firstUtmSource)),
-    utmMediums: distinct(allVisitors.map((v: any) => v.firstUtmMedium)),
-    utmCampaigns: distinct(allVisitors.map((v: any) => v.firstUtmCampaign)),
-    tags: distinct(allVisitors.flatMap((v: any) => v.tags)),
+    countries: mapCountries(facet.countries ?? []),
+    languages: mapStr(facet.languages ?? []),
+    browsers: mapStr(facet.browsers ?? []),
+    os: mapStr(facet.os ?? []),
+    devices: mapStr(facet.devices ?? []),
+    referrers: mapStr(facet.referrers ?? []),
+    utmSources: mapStr(facet.utmSources ?? []),
+    utmMediums: mapStr(facet.utmMediums ?? []),
+    utmCampaigns: mapStr(facet.utmCampaigns ?? []),
+    tags: mapTags(facet.tags ?? []),
   };
 
   const [identifiedCount, paidCount, totalCount] = await Promise.all([
-    prisma.visitor.count({ where: { projectId, email: { not: null } } }),
-    prisma.visitor.count({ where: { projectId, totalRevenue: { gt: 0 } } }),
-    prisma.visitor.count({ where: { projectId } }),
+    Visitor.countDocuments({ projectId, email: { $ne: null } }),
+    Visitor.countDocuments({ projectId, totalRevenue: { $gt: 0 } }),
+    Visitor.countDocuments({ projectId }),
   ]);
 
   const systemPrompt = `You are a visitor data filter assistant for a website analytics tool.
@@ -539,43 +522,39 @@ Respond ONLY with valid JSON in this exact format (no markdown, no code blocks):
 
     if (parsed.events?.length) {
       console.log("[AI Search] LLM returned events:", JSON.stringify(parsed.events));
-      const idSets: Set<string>[] = [];
 
-      for (const evt of parsed.events) {
-        let ids: string[] = [];
+      const idSets = await Promise.all(
+        parsed.events.map(async (evt) => {
+          let ids: string[] = [];
 
-        if (evt.type === "pageview" && evt.url) {
-          const matches = await prisma.pageView.findMany({
-            where: { projectId, url: { contains: evt.url, mode: "insensitive" } },
-            select: { visitorId: true },
-            distinct: ["visitorId"],
-          });
-          ids = matches.map((m: any) => m.visitorId);
-          console.log(`[AI Search] pageview url="${evt.url}" -> ${ids.length} visitors`);
-        } else if ((evt.type === "click" || evt.type === "form_submit") && evt.label) {
-          const allOfType = await prisma.trackEvent.findMany({
-            where: { projectId, name: evt.type },
-            select: { visitorId: true, properties: true },
-          });
-          const labelLower = evt.label.toLowerCase();
-          const matched = allOfType.filter((m: any) => {
-            const text = (m.properties as any)?.text;
-            return text && String(text).toLowerCase().includes(labelLower);
-          });
-          ids = [...new Set(matched.map((m: any) => m.visitorId))];
-          console.log(`[AI Search] ${evt.type} label="${evt.label}" -> ${ids.length} visitors (from ${allOfType.length} total)`);
-        } else if (evt.name) {
-          const matches = await prisma.trackEvent.findMany({
-            where: { projectId, name: { contains: evt.name, mode: "insensitive" } },
-            select: { visitorId: true },
-            distinct: ["visitorId"],
-          });
-          ids = matches.map((m: any) => m.visitorId);
-          console.log(`[AI Search] custom event name="${evt.name}" -> ${ids.length} visitors`);
-        }
+          if (evt.type === "pageview" && evt.url) {
+            ids = await PageView.distinct("visitorId", {
+              projectId,
+              url: { $regex: evt.url, $options: "i" },
+            });
+            console.log(`[AI Search] pageview url="${evt.url}" -> ${ids.length} visitors`);
+          } else if ((evt.type === "click" || evt.type === "form_submit") && evt.label) {
+            const allOfType = await TrackEvent.find({ projectId, name: evt.type })
+              .select("visitorId properties")
+              .lean();
+            const labelLower = evt.label.toLowerCase();
+            const matched = allOfType.filter((m) => {
+              const text = (m.properties as Record<string, unknown>)?.text;
+              return text && String(text).toLowerCase().includes(labelLower);
+            });
+            ids = [...new Set(matched.map((m) => m.visitorId))];
+            console.log(`[AI Search] ${evt.type} label="${evt.label}" -> ${ids.length} visitors (from ${allOfType.length} total)`);
+          } else if (evt.name) {
+            ids = await TrackEvent.distinct("visitorId", {
+              projectId,
+              name: { $regex: evt.name, $options: "i" },
+            });
+            console.log(`[AI Search] custom event name="${evt.name}" -> ${ids.length} visitors`);
+          }
 
-        idSets.push(new Set(ids));
-      }
+          return new Set(ids);
+        }),
+      );
 
       if (idSets.length > 0) {
         const intersection = idSets.reduce((acc, set) => {
@@ -606,10 +585,7 @@ visitors.get("/projects/:projectId/visitors/segments", async (c) => {
   const projectId = c.req.param("projectId");
   await requireProjectOwnership(projectId, userId);
 
-  const segments = await prisma.savedSegment.findMany({
-    where: { projectId },
-    orderBy: { createdAt: "desc" },
-  });
+  const segments = await SavedSegment.find({ projectId }).sort({ createdAt: -1 });
 
   return c.json({ segments });
 });
@@ -622,13 +598,11 @@ visitors.post("/projects/:projectId/visitors/segments", async (c) => {
   const body = await c.req.json<{ name: string; naturalQuery: string; filters: Record<string, string> }>();
   if (!body.name?.trim()) return c.json({ error: "Name is required" }, 400);
 
-  const segment = await prisma.savedSegment.create({
-    data: {
-      projectId,
-      name: body.name.trim(),
-      naturalQuery: body.naturalQuery || "",
-      filters: body.filters || {},
-    },
+  const segment = await SavedSegment.create({
+    projectId,
+    name: body.name.trim(),
+    naturalQuery: body.naturalQuery || "",
+    filters: body.filters || {},
   });
 
   return c.json({ segment }, 201);
@@ -640,12 +614,10 @@ visitors.delete("/projects/:projectId/visitors/segments/:segmentId", async (c) =
   const segmentId = c.req.param("segmentId");
   await requireProjectOwnership(projectId, userId);
 
-  const segment = await prisma.savedSegment.findFirst({
-    where: { id: segmentId, projectId },
-  });
+  const segment = await SavedSegment.findOne({ _id: segmentId, projectId });
   if (!segment) return c.json({ error: "Segment not found" }, 404);
 
-  await prisma.savedSegment.delete({ where: { id: segmentId } });
+  await SavedSegment.findByIdAndDelete(segmentId);
   return c.json({ ok: true });
 });
 

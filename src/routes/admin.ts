@@ -1,7 +1,17 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import Stripe from "stripe";
-import { prisma } from "../db/index.js";
+import {
+  User,
+  Plan,
+  Subscription,
+  Project,
+  ElementConfig,
+  Rule,
+  Variant,
+  Audience,
+  Event,
+} from "../db/models.js";
 import { sendEmail } from "../email/send.js";
 import * as templates from "../email/templates.js";
 
@@ -22,22 +32,19 @@ admin.get("/stats", async (c) => {
     totalEvents,
     subscriptions,
   ] = await Promise.all([
-    prisma.user.count(),
-    prisma.subscription.count({ where: { status: "active" } }),
-    prisma.project.count(),
-    prisma.event.count(),
-    prisma.subscription.findMany({
-      where: { status: "active" },
-      select: { interval: true, planId: true },
-    }),
+    User.countDocuments(),
+    Subscription.countDocuments({ status: "active" }),
+    Project.countDocuments(),
+    Event.countDocuments(),
+    Subscription.find({ status: "active" }).select("interval planId").lean(),
   ]);
 
-  const plans = await prisma.plan.findMany();
-  const planMap = new Map(plans.map((p) => [p.id, p]));
+  const plans = await Plan.find().lean();
+  const planMap = new Map(plans.map((p) => [p._id.toString(), p]));
 
   let mrr = 0;
   for (const sub of subscriptions) {
-    const plan = planMap.get(sub.planId);
+    const plan = planMap.get(sub.planId.toString());
     if (!plan) continue;
     if (sub.interval === "year") {
       mrr += plan.yearlyPrice / 12;
@@ -62,147 +69,157 @@ admin.get("/users", async (c) => {
   const search = c.req.query("search") || "";
   const skip = (page - 1) * PAGE_SIZE;
 
-  const where = search
+  const mongoWhere = search
     ? {
-        OR: [
-          { email: { contains: search, mode: "insensitive" as const } },
-          { name: { contains: search, mode: "insensitive" as const } },
+        $or: [
+          { email: { $regex: search, $options: "i" } },
+          { name: { $regex: search, $options: "i" } },
         ],
       }
     : {};
 
   const [users, total] = await Promise.all([
-    prisma.user.findMany({
-      where,
-      skip,
-      take: PAGE_SIZE,
-      orderBy: { createdAt: "desc" },
-      include: {
-        subscription: { select: { status: true, interval: true } },
-        _count: { select: { projects: true } },
-      },
-    }),
-    prisma.user.count({ where }),
+    User.find(mongoWhere).sort({ createdAt: -1 }).skip(skip).limit(PAGE_SIZE).lean(),
+    User.countDocuments(mongoWhere),
   ]);
 
+  const userIds = users.map((u) => u._id);
+  const [subscriptions, projectCounts] = await Promise.all([
+    Subscription.find({ userId: { $in: userIds } }).select("userId status interval").lean(),
+    Project.aggregate([
+      { $match: { userId: { $in: userIds } } },
+      { $group: { _id: "$userId", count: { $sum: 1 } } },
+    ]),
+  ]);
+
+  const subMap = new Map(subscriptions.map((s) => [s.userId.toString(), s]));
+  const countMap = new Map(projectCounts.map((pc) => [pc._id.toString(), pc.count]));
+
   return c.json({
-    users: users.map((u) => ({
-      id: u.id,
-      email: u.email,
-      name: u.name,
-      role: u.role,
-      subscriptionStatus: u.subscription?.status || null,
-      subscriptionInterval: u.subscription?.interval || null,
-      projectsCount: u._count.projects,
-      createdAt: u.createdAt.toISOString(),
-    })),
+    users: users.map((u) => {
+      const sub = subMap.get(u._id.toString());
+      return {
+        id: u._id.toString(),
+        email: u.email,
+        name: u.name,
+        role: u.role,
+        subscriptionStatus: sub?.status ?? null,
+        subscriptionInterval: sub?.interval ?? null,
+        projectsCount: countMap.get(u._id.toString()) ?? 0,
+        createdAt: u.createdAt.toISOString(),
+      };
+    }),
     total,
     pages: Math.ceil(total / PAGE_SIZE),
   });
 });
 
 admin.get("/users/:id", async (c) => {
-  const user = await prisma.user.findUnique({
-    where: { id: c.req.param("id") },
-    include: {
-      subscription: true,
-      projects: { select: { id: true, name: true, siteUrl: true, createdAt: true } },
-    },
-  });
+  const userId = c.req.param("id");
+  const user = await User.findById(userId).lean();
   if (!user) return c.json({ error: "User not found" }, 404);
 
+  const [subscription, projects] = await Promise.all([
+    Subscription.findOne({ userId }).lean(),
+    Project.find({ userId }).select("_id name siteUrl createdAt").lean(),
+  ]);
+
   return c.json({
-    id: user.id,
+    id: user._id.toString(),
     email: user.email,
     name: user.name,
     role: user.role,
     googleId: !!user.googleId,
     hasPassword: !!user.passwordHash,
     stripeCustomerId: user.stripeCustomerId,
-    subscription: user.subscription
+    subscription: subscription
       ? {
-          id: user.subscription.id,
-          status: user.subscription.status,
-          interval: user.subscription.interval,
-          planId: user.subscription.planId,
-          currentPeriodEnd: user.subscription.currentPeriodEnd.toISOString(),
-          cancelAtPeriodEnd: user.subscription.cancelAtPeriodEnd,
+          id: subscription._id.toString(),
+          status: subscription.status,
+          interval: subscription.interval,
+          planId: subscription.planId.toString(),
+          currentPeriodEnd: subscription.currentPeriodEnd.toISOString(),
+          cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
         }
       : null,
-    projects: user.projects,
+    projects: projects.map((p) => ({
+      id: p._id.toString(),
+      name: p.name,
+      siteUrl: p.siteUrl,
+      createdAt: p.createdAt.toISOString(),
+    })),
     createdAt: user.createdAt.toISOString(),
   });
 });
 
 admin.delete("/users/:id", async (c) => {
   const userId = c.req.param("id");
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const user = await User.findById(userId);
   if (!user) return c.json({ error: "User not found" }, 404);
 
-  const projects = await prisma.project.findMany({ where: { userId }, select: { id: true } });
-  const projectIds = projects.map((p) => p.id);
+  const projects = await Project.find({ userId }).select("_id").lean();
+  const projectIds = projects.map((p) => p._id);
 
   if (projectIds.length > 0) {
-    const elements = await prisma.elementConfig.findMany({
-      where: { projectId: { in: projectIds } },
-      select: { id: true },
-    });
-    const elementIds = elements.map((e) => e.id);
+    const elements = await ElementConfig.find({ projectId: { $in: projectIds } }).select("_id").lean();
+    const elementIds = elements.map((e) => e._id);
     if (elementIds.length > 0) {
-      await prisma.rule.deleteMany({ where: { elementId: { in: elementIds } } });
-      await prisma.variant.deleteMany({ where: { elementId: { in: elementIds } } });
-      await prisma.elementConfig.deleteMany({ where: { id: { in: elementIds } } });
+      await Rule.deleteMany({ elementId: { $in: elementIds } });
+      await Variant.deleteMany({ elementId: { $in: elementIds } });
+      await ElementConfig.deleteMany({ _id: { $in: elementIds } });
     }
-    await prisma.audience.deleteMany({ where: { projectId: { in: projectIds } } });
-    await prisma.event.deleteMany({ where: { projectId: { in: projectIds } } });
-    await prisma.project.deleteMany({ where: { userId } });
+    await Audience.deleteMany({ projectId: { $in: projectIds } });
+    await Event.deleteMany({ projectId: { $in: projectIds } });
+    await Project.deleteMany({ userId });
   }
 
-  await prisma.subscription.deleteMany({ where: { userId } });
-  await prisma.user.delete({ where: { id: userId } });
+  await Subscription.deleteMany({ userId });
+  await User.findByIdAndDelete(userId);
 
   return c.json({ message: "User deleted" });
 });
 
 admin.post("/users/:id/grant-subscription", async (c) => {
   const userId = c.req.param("id");
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const user = await User.findById(userId);
   if (!user) return c.json({ error: "User not found" }, 404);
 
-  const plan = await prisma.plan.findFirst({ where: { active: true }, orderBy: { monthlyPrice: "desc" } });
+  const plan = await Plan.findOne({ active: true }).sort({ monthlyPrice: -1 });
   if (!plan) return c.json({ error: "No active plan" }, 400);
 
   const now = new Date();
   const endDate = new Date(now);
   endDate.setFullYear(endDate.getFullYear() + 100);
 
-  await prisma.subscription.upsert({
-    where: { userId },
-    create: {
-      userId,
-      planId: plan.id,
-      stripeSubscriptionId: `admin_grant_${userId}_${Date.now()}`,
-      stripeCustomerId: user.stripeCustomerId || "admin_grant",
-      status: "active",
-      interval: "year",
-      currentPeriodStart: now,
-      currentPeriodEnd: endDate,
-      cancelAtPeriodEnd: false,
-    },
-    update: {
-      planId: plan.id,
-      status: "active",
-      currentPeriodEnd: endDate,
-      cancelAtPeriodEnd: false,
-    },
-  });
+  const createData = {
+    userId,
+    planId: plan.id,
+    stripeSubscriptionId: `admin_grant_${userId}_${Date.now()}`,
+    stripeCustomerId: user.stripeCustomerId || "admin_grant",
+    status: "active",
+    interval: "year",
+    currentPeriodStart: now,
+    currentPeriodEnd: endDate,
+    cancelAtPeriodEnd: false,
+  };
+  const updateData = {
+    planId: plan.id,
+    status: "active",
+    currentPeriodEnd: endDate,
+    cancelAtPeriodEnd: false,
+  };
+  await Subscription.findOneAndUpdate(
+    { userId },
+    { $set: updateData, $setOnInsert: createData },
+    { upsert: true, returnDocument: "after" }
+  );
 
   return c.json({ message: "Subscription granted" });
 });
 
 admin.post("/users/:id/revoke-subscription", async (c) => {
   const userId = c.req.param("id");
-  await prisma.subscription.deleteMany({ where: { userId } });
+  await Subscription.deleteMany({ userId });
   return c.json({ message: "Subscription revoked" });
 });
 
@@ -216,31 +233,32 @@ admin.get("/subscriptions", async (c) => {
   const where = status ? { status } : {};
 
   const [subs, total] = await Promise.all([
-    prisma.subscription.findMany({
-      where,
-      skip,
-      take: PAGE_SIZE,
-      orderBy: { createdAt: "desc" },
-      include: { user: { select: { email: true, name: true } } },
-    }),
-    prisma.subscription.count({ where }),
+    Subscription.find(where).sort({ createdAt: -1 }).skip(skip).limit(PAGE_SIZE).lean(),
+    Subscription.countDocuments(where),
   ]);
 
-  const plans = await prisma.plan.findMany();
-  const planMap = new Map(plans.map((p) => [p.id, p]));
+  const userIds = subs.map((s) => s.userId);
+  const plans = await Plan.find().lean();
+  const users = await User.find({ _id: { $in: userIds } }).select("email name").lean();
+
+  const planMap = new Map(plans.map((p) => [p._id.toString(), p]));
+  const userMap = new Map(users.map((u) => [u._id.toString(), u]));
 
   return c.json({
-    subscriptions: subs.map((s) => ({
-      id: s.id,
-      userId: s.userId,
-      userEmail: s.user.email,
-      userName: s.user.name,
-      planName: planMap.get(s.planId)?.name || "Unknown",
-      status: s.status,
-      interval: s.interval,
-      currentPeriodEnd: s.currentPeriodEnd.toISOString(),
-      cancelAtPeriodEnd: s.cancelAtPeriodEnd,
-    })),
+    subscriptions: subs.map((s) => {
+      const u = userMap.get(s.userId.toString());
+      return {
+        id: s._id.toString(),
+        userId: s.userId.toString(),
+        userEmail: u?.email ?? null,
+        userName: u?.name ?? null,
+        planName: planMap.get(s.planId.toString())?.name ?? "Unknown",
+        status: s.status,
+        interval: s.interval,
+        currentPeriodEnd: s.currentPeriodEnd.toISOString(),
+        cancelAtPeriodEnd: s.cancelAtPeriodEnd,
+      };
+    }),
     total,
     pages: Math.ceil(total / PAGE_SIZE),
   });
@@ -253,7 +271,7 @@ const patchSubSchema = z.object({
 });
 
 admin.patch("/subscriptions/:id", async (c) => {
-  const sub = await prisma.subscription.findUnique({ where: { id: c.req.param("id") } });
+  const sub = await Subscription.findById(c.req.param("id"));
   if (!sub) return c.json({ error: "Subscription not found" }, 404);
 
   const body = await c.req.json();
@@ -269,7 +287,7 @@ admin.patch("/subscriptions/:id", async (c) => {
     data.currentPeriodEnd = newEnd;
   }
 
-  const updated = await prisma.subscription.update({ where: { id: sub.id }, data });
+  const updated = await Subscription.findByIdAndUpdate(sub.id, data, { returnDocument: "after" });
   return c.json(updated);
 });
 
@@ -280,36 +298,40 @@ admin.get("/projects", async (c) => {
   const search = c.req.query("search") || "";
   const skip = (page - 1) * PAGE_SIZE;
 
-  const where = search
+  const mongoWhere = search
     ? {
-        OR: [
-          { name: { contains: search, mode: "insensitive" as const } },
-          { siteUrl: { contains: search, mode: "insensitive" as const } },
+        $or: [
+          { name: { $regex: search, $options: "i" } },
+          { siteUrl: { $regex: search, $options: "i" } },
         ],
       }
     : {};
 
   const [projects, total] = await Promise.all([
-    prisma.project.findMany({
-      where,
-      skip,
-      take: PAGE_SIZE,
-      orderBy: { createdAt: "desc" },
-      include: {
-        user: { select: { email: true } },
-        _count: { select: { elements: true } },
-      },
-    }),
-    prisma.project.count({ where }),
+    Project.find(mongoWhere).sort({ createdAt: -1 }).skip(skip).limit(PAGE_SIZE).lean(),
+    Project.countDocuments(mongoWhere),
   ]);
+
+  const projectIds = projects.map((p) => p._id);
+  const userIds = [...new Set(projects.map((p) => p.userId.toString()))];
+  const [users, elementCounts] = await Promise.all([
+    User.find({ _id: { $in: userIds } }).select("_id email").lean(),
+    ElementConfig.aggregate([
+      { $match: { projectId: { $in: projectIds } } },
+      { $group: { _id: "$projectId", count: { $sum: 1 } } },
+    ]),
+  ]);
+
+  const userMap = new Map(users.map((u) => [u._id.toString(), u]));
+  const countMap = new Map(elementCounts.map((ec) => [ec._id.toString(), ec.count]));
 
   return c.json({
     projects: projects.map((p) => ({
-      id: p.id,
+      id: p._id.toString(),
       name: p.name,
       siteUrl: p.siteUrl,
-      ownerEmail: p.user.email,
-      elementsCount: p._count.elements,
+      ownerEmail: userMap.get(p.userId.toString())?.email ?? null,
+      elementsCount: countMap.get(p._id.toString()) ?? 0,
       createdAt: p.createdAt.toISOString(),
     })),
     total,
@@ -318,36 +340,66 @@ admin.get("/projects", async (c) => {
 });
 
 admin.get("/projects/:id", async (c) => {
-  const project = await prisma.project.findUnique({
-    where: { id: c.req.param("id") },
-    include: {
-      user: { select: { email: true, name: true } },
-      elements: { include: { variants: true, rules: true } },
-      audiences: true,
-    },
-  });
+  const projectId = c.req.param("id");
+  const project = await Project.findById(projectId).lean();
   if (!project) return c.json({ error: "Project not found" }, 404);
-  return c.json(project);
+
+  const [owner, elements, audiences] = await Promise.all([
+    User.findById(project.userId).select("email name").lean(),
+    ElementConfig.find({ projectId }).lean(),
+    Audience.find({ projectId }).lean(),
+  ]);
+
+  const elementIds = elements.map((e) => e._id);
+  const [variants, rules] = await Promise.all([
+    Variant.find({ elementId: { $in: elementIds } }).lean(),
+    Rule.find({ elementId: { $in: elementIds } }).lean(),
+  ]);
+
+  const variantMap = new Map<string, typeof variants>();
+  for (const v of variants) {
+    const key = v.elementId.toString();
+    if (!variantMap.has(key)) variantMap.set(key, []);
+    variantMap.get(key)!.push(v);
+  }
+  const ruleMap = new Map<string, typeof rules>();
+  for (const r of rules) {
+    const key = r.elementId.toString();
+    if (!ruleMap.has(key)) ruleMap.set(key, []);
+    ruleMap.get(key)!.push(r);
+  }
+
+  const elementsWithRelations = elements.map((e) => ({
+    ...e,
+    id: e._id.toString(),
+    variants: (variantMap.get(e._id.toString()) ?? []).map((v) => ({ ...v, id: v._id.toString() })),
+    rules: (ruleMap.get(e._id.toString()) ?? []).map((r) => ({ ...r, id: r._id.toString() })),
+  }));
+
+  return c.json({
+    ...project,
+    id: project._id.toString(),
+    user: owner ? { email: owner.email, name: owner.name } : null,
+    elements: elementsWithRelations,
+    audiences: audiences.map((a) => ({ ...a, id: a._id.toString() })),
+  });
 });
 
 admin.delete("/projects/:id", async (c) => {
   const projectId = c.req.param("id");
-  const project = await prisma.project.findUnique({ where: { id: projectId } });
+  const project = await Project.findById(projectId);
   if (!project) return c.json({ error: "Project not found" }, 404);
 
-  const elements = await prisma.elementConfig.findMany({
-    where: { projectId },
-    select: { id: true },
-  });
-  const elementIds = elements.map((e) => e.id);
+  const elements = await ElementConfig.find({ projectId }).select("_id").lean();
+  const elementIds = elements.map((e) => e._id);
   if (elementIds.length > 0) {
-    await prisma.rule.deleteMany({ where: { elementId: { in: elementIds } } });
-    await prisma.variant.deleteMany({ where: { elementId: { in: elementIds } } });
-    await prisma.elementConfig.deleteMany({ where: { id: { in: elementIds } } });
+    await Rule.deleteMany({ elementId: { $in: elementIds } });
+    await Variant.deleteMany({ elementId: { $in: elementIds } });
+    await ElementConfig.deleteMany({ _id: { $in: elementIds } });
   }
-  await prisma.audience.deleteMany({ where: { projectId } });
-  await prisma.event.deleteMany({ where: { projectId } });
-  await prisma.project.delete({ where: { id: projectId } });
+  await Audience.deleteMany({ projectId });
+  await Event.deleteMany({ projectId });
+  await Project.findByIdAndDelete(projectId);
 
   return c.json({ message: "Project deleted" });
 });
@@ -355,7 +407,7 @@ admin.delete("/projects/:id", async (c) => {
 // ─── Plans ───
 
 admin.get("/plans", async (c) => {
-  const plans = await prisma.plan.findMany({ orderBy: { createdAt: "asc" } });
+  const plans = await Plan.find().sort({ createdAt: 1 });
   return c.json(plans);
 });
 
@@ -368,18 +420,14 @@ const patchPlanSchema = z.object({
 });
 
 admin.patch("/plans/:id", async (c) => {
-  const plan = await prisma.plan.findUnique({ where: { id: c.req.param("id") } });
+  const plan = await Plan.findById(c.req.param("id"));
   if (!plan) return c.json({ error: "Plan not found" }, 404);
 
   const body = await c.req.json();
   const parsed = patchPlanSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten().fieldErrors }, 400);
 
-  const updated = await prisma.plan.update({
-    where: { id: plan.id },
-    data: parsed.data,
-  });
-
+  const updated = await Plan.findByIdAndUpdate(plan.id, parsed.data, { returnDocument: "after" });
   return c.json(updated);
 });
 
@@ -433,25 +481,59 @@ admin.post("/emails/send", async (c) => {
   let users: { id: string; email: string; name: string | null }[];
 
   if (Array.isArray(recipientFilter)) {
-    users = await prisma.user.findMany({
-      where: { id: { in: recipientFilter } },
-      select: { id: true, email: true, name: true },
-    });
+    const found = await User.find({ _id: { $in: recipientFilter } }).select("_id email name").lean();
+    users = found.map((u) => ({
+      id: u._id.toString(),
+      email: u.email,
+      name: u.name ?? null,
+    }));
   } else {
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-    const filterMap: Record<string, object> = {
-      all: {},
-      active: { subscription: { status: "active" } },
-      inactive_7d: { updatedAt: { lt: sevenDaysAgo } },
-      canceled: { subscription: { status: "canceled" } },
-      no_subscription: { subscription: null },
-    };
-    users = await prisma.user.findMany({
-      where: filterMap[recipientFilter] || {},
-      select: { id: true, email: true, name: true },
-    });
+    if (recipientFilter === "all") {
+      const found = await User.find({}).select("_id email name").lean();
+      users = found.map((u) => ({
+        id: u._id.toString(),
+        email: u.email,
+        name: u.name ?? null,
+      }));
+    } else if (recipientFilter === "active") {
+      const activeSubs = await Subscription.find({ status: "active" }).select("userId").lean();
+      const userIds = activeSubs.map((s) => s.userId);
+      const found = await User.find({ _id: { $in: userIds } }).select("_id email name").lean();
+      users = found.map((u) => ({
+        id: u._id.toString(),
+        email: u.email,
+        name: u.name ?? null,
+      }));
+    } else if (recipientFilter === "inactive_7d") {
+      const found = await User.find({ updatedAt: { $lt: sevenDaysAgo } }).select("_id email name").lean();
+      users = found.map((u) => ({
+        id: u._id.toString(),
+        email: u.email,
+        name: u.name ?? null,
+      }));
+    } else if (recipientFilter === "canceled") {
+      const canceledSubs = await Subscription.find({ status: "canceled" }).select("userId").lean();
+      const userIds = canceledSubs.map((s) => s.userId);
+      const found = await User.find({ _id: { $in: userIds } }).select("_id email name").lean();
+      users = found.map((u) => ({
+        id: u._id.toString(),
+        email: u.email,
+        name: u.name ?? null,
+      }));
+    } else if (recipientFilter === "no_subscription") {
+      const subUserIds = await Subscription.distinct("userId");
+      const found = await User.find({ _id: { $nin: subUserIds } }).select("_id email name").lean();
+      users = found.map((u) => ({
+        id: u._id.toString(),
+        email: u.email,
+        name: u.name ?? null,
+      }));
+    } else {
+      users = [];
+    }
   }
 
   let sent = 0;

@@ -1,6 +1,6 @@
 import { createMiddleware } from "hono/factory";
 import { HTTPException } from "hono/http-exception";
-import { prisma } from "../db/index.js";
+import { User } from "../db/models.js";
 
 type Env = {
   Variables: {
@@ -14,10 +14,7 @@ export const requireAdmin = createMiddleware<Env>(async (c, next) => {
     throw new HTTPException(401, { message: "Authentication required" });
   }
 
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { role: true },
-  });
+  const user = await User.findById(userId).select("role");
 
   if (!user || user.role !== "admin") {
     throw new HTTPException(403, { message: "Admin access required" });
