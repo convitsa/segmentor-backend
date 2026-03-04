@@ -63,7 +63,6 @@ ENV AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
 ENV AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
 ENV AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT}
 
-RUN bunx prisma generate
 RUN bun run build
 
 # Remove default nginx site and install our config
