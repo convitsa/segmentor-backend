@@ -6,6 +6,23 @@ import { CustomerEvent, Event, PageView, Session, Visitor } from "../db/models.j
 
 type Env = { Variables: { userId: string } };
 
+function fillDateRange<T extends Record<string, unknown>>(
+  since: Date,
+  data: (T & { date: string })[],
+  defaults: Omit<T, "date">,
+): (T & { date: string })[] {
+  const map = new Map(data.map((d) => [d.date, d]));
+  const result: (T & { date: string })[] = [];
+  const today = new Date().toISOString().slice(0, 10);
+  const cursor = new Date(since);
+  while (cursor.toISOString().slice(0, 10) <= today) {
+    const key = cursor.toISOString().slice(0, 10);
+    result.push(map.get(key) ?? ({ ...defaults, date: key } as T & { date: string }));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return result;
+}
+
 const analytics = new Hono<Env>();
 
 analytics.use("/*", requireAuth);
@@ -173,9 +190,9 @@ analytics.get("/projects/:projectId/analytics", async (c) => {
   }));
 
   const byDayRaw = (data.byDay as { _id: string; count: number; visitors: string[] }[]) || [];
-  const dailyStats = byDayRaw
-    .sort((a, b) => a._id.localeCompare(b._id))
+  const dailyStatsRaw = byDayRaw
     .map((d) => ({ date: d._id, impressions: d.count, visitors: d.visitors?.length ?? 0 }));
+  const dailyStats = fillDateRange(since, dailyStatsRaw, { impressions: 0, visitors: 0 });
 
   const elementStats = ((data.byElement as { _id: string; count: number }[]) || []).map((e) => ({
     elementId: e._id,
@@ -260,12 +277,55 @@ analytics.get("/projects/:projectId/analytics/overview", async (c) => {
 
   const projectIdObj = new mongoose.Types.ObjectId(projectId);
 
-  const visitorMatch = { projectId: projectIdObj, lastSeenAt: { $gte: since } };
-  const prevVisitorMatch = { projectId: projectIdObj, lastSeenAt: { $gte: prevSince, $lt: since } };
-  const sessionMatch = { projectId: projectIdObj, startedAt: { $gte: since } };
-  const prevSessionMatch = { projectId: projectIdObj, startedAt: { $gte: prevSince, $lt: since } };
-  const pageViewMatch = { projectId: projectIdObj, timestamp: { $gte: since } };
-  const revenueMatch = { projectId: projectIdObj, timestamp: { $gte: since }, type: "purchase" };
+  const filterCountry = c.req.query("country") || "";
+  const filterDevice = c.req.query("device") || "";
+  const filterUrl = c.req.query("url") || "";
+
+  const visitorExtraMatch: Record<string, unknown> = {};
+  if (filterCountry) {
+    const codes = filterCountry.split(",").map(s => s.trim().toUpperCase());
+    visitorExtraMatch.$or = [{ countryCode: { $in: codes } }, { country: { $in: codes } }];
+  }
+  if (filterDevice) {
+    const devices = filterDevice.split(",").map(s => s.trim().toLowerCase());
+    visitorExtraMatch.device = { $in: devices };
+  }
+
+  const pvExtraMatch: Record<string, unknown> = {};
+  if (filterUrl) pvExtraMatch.url = filterUrl === "/" ? { $in: ["/", null, ""] } : filterUrl;
+  if (filterCountry) {
+    const codes = filterCountry.split(",").map(s => s.trim().toUpperCase());
+    pvExtraMatch.$or = [{ countryCode: { $in: codes } }, { country: { $in: codes } }];
+  }
+
+  const visitorMatch: Record<string, unknown> = { projectId: projectIdObj, lastSeenAt: { $gte: since }, ...visitorExtraMatch };
+  const prevVisitorMatch: Record<string, unknown> = { projectId: projectIdObj, lastSeenAt: { $gte: prevSince, $lt: since }, ...visitorExtraMatch };
+  const sessionMatch: Record<string, unknown> = { projectId: projectIdObj, startedAt: { $gte: since } };
+  if (filterDevice) {
+    const devices = filterDevice.split(",").map(s => s.trim().toLowerCase());
+    sessionMatch.device = { $in: devices };
+  }
+  if (filterCountry) {
+    const codes = filterCountry.split(",").map(s => s.trim().toUpperCase());
+    sessionMatch.$or = [{ countryCode: { $in: codes } }, { country: { $in: codes } }];
+  }
+  const prevSessionMatch: Record<string, unknown> = { projectId: projectIdObj, startedAt: { $gte: prevSince, $lt: since } };
+  if (filterDevice) {
+    const devices = filterDevice.split(",").map(s => s.trim().toLowerCase());
+    prevSessionMatch.device = { $in: devices };
+  }
+  if (filterCountry) {
+    const codes = filterCountry.split(",").map(s => s.trim().toUpperCase());
+    prevSessionMatch.$or = [{ countryCode: { $in: codes } }, { country: { $in: codes } }];
+  }
+  const pageViewMatch: Record<string, unknown> = { projectId: projectIdObj, timestamp: { $gte: since }, ...pvExtraMatch };
+  const revenueMatch: Record<string, unknown> = { projectId: projectIdObj, timestamp: { $gte: since }, type: "purchase", ...pvExtraMatch };
+
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
+  const prevPageViewMatch: Record<string, unknown> = { projectId: projectIdObj, timestamp: { $gte: prevSince, $lt: since }, ...pvExtraMatch };
+  const prevRevenueMatch: Record<string, unknown> = { projectId: projectIdObj, timestamp: { $gte: prevSince, $lt: since }, type: "purchase", ...pvExtraMatch };
 
   const [
     visitorAggResult,
@@ -275,6 +335,12 @@ analytics.get("/projects/:projectId/analytics/overview", async (c) => {
     pageViewAggResult,
     revenueResult,
     topPagesResult,
+    prevPageviewCount,
+    prevRevenueResult,
+    todayVisitorCount,
+    liveVisitorCount,
+    filterOptionsResult,
+    distinctUrls,
   ] = await Promise.all([
     Visitor.aggregate([
       { $match: visitorMatch },
@@ -345,6 +411,27 @@ analytics.get("/projects/:projectId/analytics/overview", async (c) => {
       { $sort: { count: -1 } },
       { $limit: 20 },
     ]),
+    PageView.countDocuments(prevPageViewMatch),
+    CustomerEvent.aggregate([
+      { $match: prevRevenueMatch },
+      { $group: { _id: null, totalRevenue: { $sum: { $ifNull: ["$amount", 0] } } } },
+    ]),
+    Visitor.countDocuments({ projectId: projectIdObj, lastSeenAt: { $gte: todayStart } }),
+    Visitor.countDocuments({ projectId: projectIdObj, lastSeenAt: { $gte: fiveMinAgo } }),
+    Visitor.aggregate([
+      { $match: { projectId: projectIdObj, lastSeenAt: { $gte: since } } },
+      { $facet: {
+        countries: [
+          { $group: { _id: { $ifNull: ["$countryCode", "$country"] } } },
+          { $match: { _id: { $nin: [null, "", "Unknown"] } } },
+        ],
+        devices: [
+          { $group: { _id: "$device" } },
+          { $match: { _id: { $nin: [null, ""] } } },
+        ],
+      } },
+    ]),
+    PageView.distinct("url", { projectId: projectIdObj, timestamp: { $gte: since } }),
   ]);
 
   const visitorData = visitorAggResult[0] as Record<string, unknown[]>;
@@ -361,7 +448,9 @@ analytics.get("/projects/:projectId/analytics/overview", async (c) => {
   const totalSessions = sessionTotals?.count ?? sessions.length;
   const prevTotalSessions = prevSessionCount;
   const totalPageviews = (pageViewAggResult as { _id: string; pageviews: number }[]).reduce((sum, d) => sum + d.pageviews, 0);
+  const prevTotalPageviews = prevPageviewCount;
   const totalRevenue = (revenueResult[0] as { totalRevenue: number } | undefined)?.totalRevenue ?? 0;
+  const prevTotalRevenue = (prevRevenueResult[0] as { totalRevenue: number } | undefined)?.totalRevenue ?? 0;
   const totalOrders = (revenueResult[0] as { totalOrders: number } | undefined)?.totalOrders ?? 0;
 
   const avgSessionDuration = totalSessions > 0 && sessionTotals
@@ -374,12 +463,12 @@ analytics.get("/projects/:projectId/analytics/overview", async (c) => {
 
   const visitorsWithFirstSeen = new Map(visitors.map((v) => [v.visitorId, v.firstSeenAt]));
 
+  const todayKey = new Date().toISOString().slice(0, 10);
   const byDay: Record<string, { visitors: number; newVisitors: number; sessions: number; pageviews: number }> = {};
-  for (let d = 0; d < days; d++) {
-    const date = new Date(since);
-    date.setDate(date.getDate() + d);
-    const key = date.toISOString().slice(0, 10);
-    byDay[key] = { visitors: 0, newVisitors: 0, sessions: 0, pageviews: 0 };
+  const cursor = new Date(since);
+  while (cursor.toISOString().slice(0, 10) <= todayKey) {
+    byDay[cursor.toISOString().slice(0, 10)] = { visitors: 0, newVisitors: 0, sessions: 0, pageviews: 0 };
+    cursor.setDate(cursor.getDate() + 1);
   }
 
   for (const [day, pvData] of pageViewByDay) {
@@ -422,10 +511,20 @@ analytics.get("/projects/:projectId/analytics/overview", async (c) => {
     pageviews: p.count,
   }));
 
+  const foData = filterOptionsResult[0] as Record<string, { _id: string }[]>;
+  const availableCountries = (foData?.countries?.map(x => x._id).filter(Boolean) ?? []).sort();
+  const availableDevices = (foData?.devices?.map(x => x._id).filter(Boolean) ?? []).sort();
+  const availableUrls = ((distinctUrls as string[]) ?? []).filter(Boolean).sort();
+
   return c.json({
     period: { days, since: since.toISOString() },
     totalVisitors,
-    previousPeriod: { totalVisitors: prevTotalVisitors, totalSessions: prevTotalSessions },
+    previousPeriod: {
+      totalVisitors: prevTotalVisitors,
+      totalSessions: prevTotalSessions,
+      totalPageviews: prevTotalPageviews,
+      totalRevenue: prevTotalRevenue,
+    },
     newVisitors,
     returningVisitors,
     totalSessions,
@@ -434,10 +533,17 @@ analytics.get("/projects/:projectId/analytics/overview", async (c) => {
     bounceRate,
     totalRevenue,
     totalOrders,
+    todayVisitors: todayVisitorCount,
+    liveVisitors: liveVisitorCount,
     dailyStats,
     countryStats,
     deviceStats,
     pageStats,
+    filterOptions: {
+      countries: availableCountries,
+      devices: availableDevices,
+      urls: availableUrls,
+    },
   });
 });
 

@@ -10,7 +10,6 @@ import {
   TrackEvent,
   SegiConversation,
   SegiMessage,
-  SessionRecording,
 } from "../db/models.js";
 import { AzureOpenAI } from "openai";
 import { distance } from "fastest-levenshtein";
@@ -152,53 +151,6 @@ const TOOL_DEFINITIONS: ChatCompletionTool[] = [
           name: { type: "string", description: "Visitor name or email to look up (case-insensitive fuzzy match)" },
         },
         required: ["name"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "search_recordings",
-      description: "Search session recordings by visitor, page, clicked element, sentiment, or friction. Use when the user asks about recorded sessions, visitor behavior patterns, what visitors did on the site, click journeys, or friction points.",
-      parameters: {
-        type: "object",
-        properties: {
-          visitorId: { type: "string", description: "Filter by visitor ID or name" },
-          page: { type: "string", description: "Filter by page URL visited" },
-          clickedElement: { type: "string", description: "Filter recordings where visitor clicked element with this text" },
-          notClickedElement: { type: "string", description: "Exclude recordings where visitor clicked this element text" },
-          sentiment: { type: "string", enum: ["positive", "neutral", "frustrated"], description: "Filter by session sentiment" },
-          hasFriction: { type: "string", enum: ["true"], description: "Only recordings with friction points" },
-          country: { type: "string", description: "2-letter country code" },
-          device: { type: "string", description: "Device type: desktop, mobile, tablet" },
-          utmSource: { type: "string", description: "UTM source" },
-          referrer: { type: "string", description: "Referrer URL" },
-          dateFrom: { type: "string", description: "Start date (YYYY-MM-DD)" },
-          dateTo: { type: "string", description: "End date (YYYY-MM-DD)" },
-        },
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "analyze_behavior_patterns",
-      description: "Analyze behavior patterns across multiple session recordings. Use when the user asks questions like 'which users clicked X but didn't Y', 'why are users from country X not converting', 'what's the common behavior pattern'. Returns AI-powered analysis with insights and suggestions.",
-      parameters: {
-        type: "object",
-        properties: {
-          question: { type: "string", description: "The behavior analysis question to answer" },
-          country: { type: "string", description: "Filter recordings by country code" },
-          device: { type: "string", description: "Filter by device type" },
-          utmSource: { type: "string", description: "Filter by UTM source" },
-          referrer: { type: "string", description: "Filter by referrer" },
-          clickedElement: { type: "string", description: "Only recordings where this element was clicked" },
-          notClickedElement: { type: "string", description: "Exclude recordings where this was clicked" },
-          page: { type: "string", description: "Only recordings that visited this page" },
-        },
-        required: ["question"],
         additionalProperties: false,
       },
     },
@@ -496,204 +448,12 @@ async function executeGetVisitorDetails(projectId: string, args: any) {
   };
 }
 
-async function executeSearchRecordings(projectId: string, args: any) {
-  const where: Record<string, unknown> = { projectId, status: "analyzed" };
-
-  if (args.sentiment) where.sentiment = args.sentiment;
-  if (args.page) where.pagesVisited = args.page;
-  if (args.dateFrom || args.dateTo) {
-    const startedAt: Record<string, Date> = {};
-    if (args.dateFrom) startedAt.$gte = new Date(args.dateFrom);
-    if (args.dateTo) startedAt.$lte = new Date(args.dateTo);
-    where.startedAt = startedAt;
-  }
-
-  let recordings = await SessionRecording.find(where)
-    .sort({ startedAt: -1 })
-    .limit(200)
-    .select("visitorId sessionId duration pagesVisited summary sentiment journeySteps clickPoints frictionPoints startedAt")
-    .lean();
-
-  if (args.clickedElement) {
-    const searchText = args.clickedElement.toLowerCase();
-    recordings = recordings.filter((r) => {
-      const clicks = (r.clickPoints as any[]) || [];
-      const journey = (r.journeySteps as any[]) || [];
-      const summaryMatch = r.summary?.toLowerCase().includes(searchText);
-      const clickMatch = clicks.some((c) => c.text?.toLowerCase().includes(searchText));
-      const journeyMatch = journey.some((j: any) => j.action?.toLowerCase().includes(searchText));
-      return summaryMatch || clickMatch || journeyMatch;
-    });
-  }
-
-  if (args.notClickedElement) {
-    const excludeText = args.notClickedElement.toLowerCase();
-    recordings = recordings.filter((r) => {
-      const clicks = (r.clickPoints as any[]) || [];
-      const journey = (r.journeySteps as any[]) || [];
-      const summaryMatch = r.summary?.toLowerCase().includes(excludeText);
-      const clickMatch = clicks.some((c) => c.text?.toLowerCase().includes(excludeText));
-      const journeyMatch = journey.some((j: any) => j.action?.toLowerCase().includes(excludeText));
-      return !summaryMatch && !clickMatch && !journeyMatch;
-    });
-  }
-
-  if (args.hasFriction === "true") {
-    recordings = recordings.filter((r) => {
-      const friction = (r.frictionPoints as any[]) || [];
-      return friction.length > 0;
-    });
-  }
-
-  // Filter by visitor attributes if needed
-  if (args.country || args.device || args.utmSource || args.referrer || args.visitorId) {
-    const visitorWhere: Record<string, unknown> = { projectId };
-    if (args.country) visitorWhere.countryCode = args.country.toUpperCase();
-    if (args.device) visitorWhere.device = args.device.toLowerCase();
-    if (args.utmSource) visitorWhere.firstUtmSource = { $regex: args.utmSource, $options: "i" };
-    if (args.referrer) visitorWhere.firstReferrer = { $regex: args.referrer, $options: "i" };
-    if (args.visitorId) {
-      visitorWhere.$or = [
-        { name: { $regex: args.visitorId, $options: "i" } },
-        { visitorId: { $regex: args.visitorId, $options: "i" } },
-        { email: { $regex: args.visitorId, $options: "i" } },
-      ];
-    }
-
-    const matchingVisitors = await Visitor.find(visitorWhere)
-      .select("visitorId")
-      .lean();
-    const visitorIdSet = new Set(matchingVisitors.map((v: any) => v.visitorId));
-    recordings = recordings.filter((r: any) => visitorIdSet.has(r.visitorId));
-  }
-
-  const visitorIds = [...new Set(recordings.map((r: any) => r.visitorId))];
-  const visitors = await Visitor.find({ projectId, visitorId: { $in: visitorIds } })
-    .select("visitorId name country countryCode device firstUtmSource firstReferrer")
-    .lean();
-  const visitorMap = new Map(visitors.map((v: any) => [v.visitorId, v]));
-
-  const sentimentBreakdown: Record<string, number> = {};
-  const countryBreakdown: Record<string, number> = {};
-  const deviceBreakdown: Record<string, number> = {};
-
-  for (const r of recordings) {
-    sentimentBreakdown[(r as any).sentiment || "unknown"] = (sentimentBreakdown[(r as any).sentiment || "unknown"] || 0) + 1;
-    const v = visitorMap.get((r as any).visitorId) as any;
-    if (v?.countryCode) countryBreakdown[v.countryCode] = (countryBreakdown[v.countryCode] || 0) + 1;
-    if (v?.device) deviceBreakdown[v.device] = (deviceBreakdown[v.device] || 0) + 1;
-  }
-
-  return {
-    matchedCount: recordings.length,
-    recordings: recordings.slice(0, 20).map((r: any) => ({
-      id: r._id?.toString() ?? r.id,
-      visitorName: (visitorMap.get(r.visitorId) as any)?.name || r.visitorId,
-      country: (visitorMap.get(r.visitorId) as any)?.country,
-      device: (visitorMap.get(r.visitorId) as any)?.device,
-      duration: r.duration,
-      pagesVisited: r.pagesVisited,
-      summary: r.summary,
-      sentiment: r.sentiment,
-      frictionCount: ((r.frictionPoints as any[]) || []).length,
-      startedAt: r.startedAt,
-    })),
-    breakdown: { sentimentBreakdown, countryBreakdown, deviceBreakdown },
-    summary: `Found ${recordings.length} recorded session${recordings.length !== 1 ? "s" : ""} matching the criteria`,
-  };
-}
-
-async function executeAnalyzeBehaviorPatterns(projectId: string, args: any) {
-  const searchArgs: any = {};
-  if (args.country) searchArgs.country = args.country;
-  if (args.device) searchArgs.device = args.device;
-  if (args.utmSource) searchArgs.utmSource = args.utmSource;
-  if (args.referrer) searchArgs.referrer = args.referrer;
-  if (args.clickedElement) searchArgs.clickedElement = args.clickedElement;
-  if (args.notClickedElement) searchArgs.notClickedElement = args.notClickedElement;
-  if (args.page) searchArgs.page = args.page;
-
-  const results = await executeSearchRecordings(projectId, searchArgs);
-
-  if (results.matchedCount === 0) {
-    return {
-      analysis: "No session recordings match the given criteria. Try broadening your filters or ensure session recording is enabled.",
-      matchedCount: 0,
-      suggestions: [],
-    };
-  }
-
-  const summaries = results.recordings
-    .map((r) => `- ${r.visitorName} (${r.country || "unknown"}, ${r.device || "unknown"}): ${r.summary} [sentiment: ${r.sentiment}]`)
-    .join("\n");
-
-  const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
-  const apiKey = process.env.AZURE_OPENAI_API_KEY;
-  if (!endpoint || !apiKey) {
-    return {
-      analysis: `Based on ${results.matchedCount} recordings: ${results.recordings.map((r) => r.summary).join(" ")}`,
-      matchedCount: results.matchedCount,
-      breakdown: results.breakdown,
-      suggestions: ["Enable AI (Azure OpenAI) for deeper analysis"],
-    };
-  }
-
-  const client = new AzureOpenAI({ endpoint, apiKey, apiVersion: "2024-08-01-preview" });
-  const deployment = process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4o-mini";
-
-  const prompt = `You are a conversion optimization expert. Analyze these ${results.matchedCount} session recording summaries and answer the user's question.
-
-User's question: "${args.question}"
-
-Session summaries:
-${summaries}
-
-Breakdown:
-- Sentiment: ${JSON.stringify(results.breakdown.sentimentBreakdown)}
-- Countries: ${JSON.stringify(results.breakdown.countryBreakdown)}
-- Devices: ${JSON.stringify(results.breakdown.deviceBreakdown)}
-
-Respond with valid JSON only (no markdown fences):
-{
-  "analysis": "Clear, data-driven answer to the question with specific numbers and percentages",
-  "patterns": ["list of observed behavior patterns"],
-  "suggestions": ["actionable suggestions to improve conversion, be specific with numbers like '10% discount' or 'simplified 2-step process'"]
-}`;
-
-  const response = await client.chat.completions.create({
-    model: deployment,
-    messages: [
-      { role: "system", content: "You are a conversion optimization and UX expert. Provide data-driven insights from session recordings. Always respond with valid JSON only." },
-      { role: "user", content: prompt },
-    ],
-    temperature: 0.4,
-    max_tokens: 1000,
-  });
-
-  const content = response.choices[0]?.message?.content || "";
-  let parsed: any;
-  try {
-    const cleaned = content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    parsed = JSON.parse(cleaned);
-  } catch {
-    parsed = { analysis: content, patterns: [], suggestions: [] };
-  }
-
-  return {
-    analysis: parsed.analysis || content,
-    patterns: parsed.patterns || [],
-    suggestions: parsed.suggestions || [],
-    matchedCount: results.matchedCount,
-    breakdown: results.breakdown,
-  };
-}
-
 // ─── Context Builder ────────────────────────────────────────────────
 
 async function buildSystemPrompt(projectId: string, userQuery: string) {
   const projectIdObj = new mongoose.Types.ObjectId(projectId);
 
-  const [visitorFacets, trackEventFacets, topPagesRaw, recentClicks, recentForms, samplePages, totalCount, identifiedCount, paidCount, recordingCount, analyzedRecordingCount] = await Promise.all([
+  const [visitorFacets, trackEventFacets, topPagesRaw, recentClicks, recentForms, samplePages, totalCount, identifiedCount, paidCount] = await Promise.all([
     Visitor.aggregate([
       { $match: { projectId: projectIdObj } },
       {
@@ -740,8 +500,6 @@ async function buildSystemPrompt(projectId: string, userQuery: string) {
     Visitor.countDocuments({ projectId }),
     Visitor.countDocuments({ projectId, email: { $ne: null } }),
     Visitor.countDocuments({ projectId, totalRevenue: { $gt: 0 } }),
-    SessionRecording.countDocuments({ projectId }),
-    SessionRecording.countDocuments({ projectId, status: "analyzed" }),
   ]);
 
   const facets = visitorFacets[0] ?? {};
@@ -836,15 +594,7 @@ EVENT DATA MODEL:
 
 When using filter_visitors with events, use the "label" field for clicks/form_submit matching the labels above. Use fuzzy matching - the label you provide will be matched against stored data.
 
-IMPORTANT: After using export_visitors, do NOT include download links or URLs in your text response. The UI already shows a download button for the user. Just confirm what was exported (e.g. "Exported 23 visitors from Azerbaijan as CSV.").
-
-SESSION RECORDINGS:
-- Total recordings: ${recordingCount}
-- Analyzed recordings: ${analyzedRecordingCount}
-- Use search_recordings when users ask about session recordings, visitor journeys, click behavior, what visitors did, or friction points.
-- Use analyze_behavior_patterns for complex behavioral questions like "which users clicked X but didn't Y", "why are users from country X not converting", or funnel analysis.
-- When analyze_behavior_patterns returns suggestions, present them as actionable recommendations (e.g. "Consider offering a 10% discount for visitors from Portugal").
-- If recordings data is available, prefer it over basic visitor filters for behavioral questions since recordings contain richer interaction data.${relevantSection}${sampleSection}${samplePageSection}`;
+IMPORTANT: After using export_visitors, do NOT include download links or URLs in your text response. The UI already shows a download button for the user. Just confirm what was exported (e.g. "Exported 23 visitors from Azerbaijan as CSV.").${relevantSection}${sampleSection}${samplePageSection}`;
 
   return { prompt, clickLabels, formIds };
 }
@@ -1031,10 +781,6 @@ segi.post("/projects/:projectId/segi/chat", async (c) => {
                 toolResult = { cleared: true, summary: "All filters have been cleared. Showing all visitors." };
               } else if (tc.name === "get_visitor_details") {
                 toolResult = await executeGetVisitorDetails(projectId, parsedArgs);
-              } else if (tc.name === "search_recordings") {
-                toolResult = await executeSearchRecordings(projectId, parsedArgs);
-              } else if (tc.name === "analyze_behavior_patterns") {
-                toolResult = await executeAnalyzeBehaviorPatterns(projectId, parsedArgs);
               } else {
                 toolResult = { error: "Unknown tool" };
               }

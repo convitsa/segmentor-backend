@@ -9,10 +9,14 @@ import {
   PageView,
   TrackEvent,
   CustomerEvent,
+  Recording,
+  RecordingChunk,
 } from "../db/models.js";
 import { readFileSync, existsSync } from "fs";
+import { analyzeAndStore } from "../services/journeyAnalyzer.js";
 import { join } from "path";
 import { lookup } from "mime-types";
+import { gzipSync } from "zlib";
 import { broadcast } from "../lib/websocket-hub.js";
 import { friendlyName } from "../lib/friendly-name.js";
 
@@ -178,6 +182,12 @@ const ingestEventSchema = z.discriminatedUnion("type", [
     type: z.literal("session_end"),
     ts: z.number(),
   }),
+  z.object({
+    type: z.literal("s"),
+    d: z.array(z.record(z.unknown())),
+    seq: z.number(),
+    ts: z.number(),
+  }),
 ]);
 
 const ingestBodySchema = z.object({
@@ -248,9 +258,11 @@ pub.post("/ingest", async (c) => {
 
     let pvCount = 0;
     let evtCount = 0;
+    let clickCount = 0;
     let firstPageUrl: string | null = null;
     let lastPageUrl: string | null = null;
     let hasSessionEnd = false;
+    const snapshotChunks: Array<{ d: Record<string, unknown>[]; seq: number }> = [];
 
     for (const evt of body.events) {
       const ts = new Date(evt.ts);
@@ -272,6 +284,7 @@ pub.post("/ingest", async (c) => {
         });
       } else if (evt.type === "click" || evt.type === "form_submit") {
         evtCount++;
+        if (evt.type === "click") clickCount++;
         trackEvents.push({
           projectId: pid, visitorId: vid, sessionId: sid,
           name: evt.type, properties: evt.properties || {},
@@ -296,6 +309,8 @@ pub.post("/ingest", async (c) => {
         });
       } else if (evt.type === "session_end") {
         hasSessionEnd = true;
+      } else if (evt.type === "s") {
+        snapshotChunks.push({ d: evt.d, seq: evt.seq });
       }
     }
 
@@ -407,6 +422,70 @@ pub.post("/ingest", async (c) => {
 
     await Promise.all(ops);
 
+    // Snapshot chunks are processed in the background so the ingest
+    // response is not delayed by gzip compression + extra DB writes.
+    if (snapshotChunks.length > 0) {
+      const bgSnapshotChunks = snapshotChunks;
+      const bgPvCount = pvCount;
+      const bgClickCount = clickCount;
+      (async () => {
+        try {
+          const bgOps: Promise<unknown>[] = [];
+
+          for (const chunk of bgSnapshotChunks) {
+            const raw = JSON.stringify(chunk.d);
+            const compressed = gzipSync(Buffer.from(raw));
+            bgOps.push(
+              RecordingChunk.create({
+                projectId: pid,
+                sessionId: sid,
+                seqNum: chunk.seq,
+                events: compressed,
+                eventCount: chunk.d.length,
+              }),
+            );
+          }
+
+          const totalNewSize = bgSnapshotChunks.reduce(
+            (s, c) => s + JSON.stringify(c.d).length,
+            0,
+          );
+
+          bgOps.push(
+            Recording.findOneAndUpdate(
+              { projectId: pid, sessionId: sid },
+              {
+                $set: { endedAt: now, status: "recording" },
+                $inc: {
+                  chunkCount: bgSnapshotChunks.length,
+                  totalSize: totalNewSize,
+                  pageCount: bgPvCount,
+                  clickCount: bgClickCount,
+                },
+                $setOnInsert: {
+                  projectId: pid,
+                  sessionId: sid,
+                  visitorId: vid,
+                  startedAt: now,
+                  entryUrl: firstPageUrl || null,
+                  device: ctx.device || null,
+                  browser: ctx.browser || null,
+                  os: ctx.os || null,
+                  country: geo.country || null,
+                  countryCode: geo.countryCode || null,
+                },
+              },
+              { upsert: true },
+            ),
+          );
+
+          await Promise.all(bgOps);
+        } catch (err) {
+          console.error("Background snapshot store error:", err);
+        }
+      })();
+    }
+
     const ts = now.toISOString();
 
     for (const evt of body.events) {
@@ -468,6 +547,12 @@ pub.post("/ingest", async (c) => {
           timestamp: ts,
         });
       }
+    }
+
+    if (hasSessionEnd) {
+      analyzeAndStore(pid, sid).catch((err) =>
+        console.error("Journey analysis trigger error:", err),
+      );
     }
 
     if (!hasSessionEnd) {

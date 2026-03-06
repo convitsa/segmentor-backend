@@ -70,7 +70,6 @@ export interface ProjectConfigDTO {
   id: string;
   siteUrl: string;
   elements: ElementConfigDTO[];
-  recordingEnabled?: boolean;
 }
 
 export interface AudienceDTO {
@@ -92,7 +91,6 @@ export interface ProjectDTO {
   name: string;
   siteUrl: string;
   publicKey: string;
-  recordingEnabled: boolean;
   userId: string;
   createdAt: string;
   updatedAt: string;

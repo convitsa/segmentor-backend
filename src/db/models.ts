@@ -80,6 +80,7 @@ const projectSchema = new Schema(
     siteUrl: { type: String, required: true },
     publicKey: { type: String, required: true, unique: true },
     recordingEnabled: { type: Boolean, default: false },
+    recordingSampleRate: { type: Number, default: 1.0, min: 0, max: 1 },
   },
   opts("Project", true),
 );
@@ -193,6 +194,8 @@ const visitorSchema = new Schema(
     tags: [String],
     firstSeenAt: { type: Date, default: Date.now },
     lastSeenAt: { type: Date, default: Date.now },
+    aiSummary: String,
+    aiSummaryUpdatedAt: Date,
   },
   opts("Visitor"),
 );
@@ -332,36 +335,6 @@ const segiMessageSchema = new Schema(
 segiMessageSchema.index({ conversationId: 1, createdAt: 1 });
 export const SegiMessage = mongoose.model("SegiMessage", segiMessageSchema);
 
-// ─── SessionRecording ─────────────────────────────────────────────────
-
-const sessionRecordingSchema = new Schema(
-  {
-    projectId: { type: Schema.Types.ObjectId, required: true },
-    visitorId: { type: String, required: true },
-    sessionId: { type: String, required: true },
-    status: { type: String, default: "recording" },
-    eventsFile: String,
-    eventsCount: { type: Number, default: 0 },
-    duration: { type: Number, default: 0 },
-    pagesVisited: [String],
-    startedAt: { type: Date, default: Date.now },
-    endedAt: Date,
-    summary: String,
-    journeySteps: Schema.Types.Mixed,
-    clickPoints: Schema.Types.Mixed,
-    frictionPoints: Schema.Types.Mixed,
-    conversionEvents: Schema.Types.Mixed,
-    sentiment: String,
-    analyzedAt: Date,
-  },
-  opts("SessionRecording"),
-);
-sessionRecordingSchema.index({ projectId: 1, sessionId: 1 }, { unique: true });
-sessionRecordingSchema.index({ projectId: 1, startedAt: 1 });
-sessionRecordingSchema.index({ projectId: 1, visitorId: 1 });
-sessionRecordingSchema.index({ projectId: 1, status: 1 });
-export const SessionRecording = mongoose.model("SessionRecording", sessionRecordingSchema);
-
 // ─── CustomerEvent ────────────────────────────────────────────────────
 
 const customerEventSchema = new Schema(
@@ -383,3 +356,57 @@ const customerEventSchema = new Schema(
 customerEventSchema.index({ projectId: 1, timestamp: 1 });
 customerEventSchema.index({ projectId: 1, visitorId: 1 });
 export const CustomerEvent = mongoose.model("CustomerEvent", customerEventSchema);
+
+// ─── Recording (session replay metadata) ─────────────────────────────
+
+const recordingSchema = new Schema(
+  {
+    projectId: { type: Schema.Types.ObjectId, required: true },
+    sessionId: { type: String, required: true },
+    visitorId: { type: String, required: true },
+    status: { type: String, default: "recording" },
+    startedAt: { type: Date, default: Date.now },
+    endedAt: Date,
+    duration: { type: Number, default: 0 },
+    pageCount: { type: Number, default: 0 },
+    clickCount: { type: Number, default: 0 },
+    entryUrl: String,
+    device: String,
+    browser: String,
+    os: String,
+    country: String,
+    countryCode: String,
+    chunkCount: { type: Number, default: 0 },
+    totalSize: { type: Number, default: 0 },
+    journeySummary: String,
+    journeyAnalyzedAt: Date,
+  },
+  opts("Recording"),
+);
+recordingSchema.index({ projectId: 1, sessionId: 1 }, { unique: true });
+recordingSchema.index({ projectId: 1, startedAt: -1 });
+recordingSchema.index(
+  { startedAt: 1 },
+  { expireAfterSeconds: 30 * 24 * 60 * 60 },
+);
+export const Recording = mongoose.model("Recording", recordingSchema);
+
+// ─── RecordingChunk (rrweb event batches) ─────────────────────────────
+
+const recordingChunkSchema = new Schema(
+  {
+    projectId: { type: Schema.Types.ObjectId, required: true },
+    sessionId: { type: String, required: true },
+    seqNum: { type: Number, required: true },
+    events: { type: Buffer, required: true },
+    eventCount: { type: Number, default: 0 },
+    createdAt: { type: Date, default: Date.now },
+  },
+  opts("RecordingChunk"),
+);
+recordingChunkSchema.index({ projectId: 1, sessionId: 1, seqNum: 1 });
+recordingChunkSchema.index(
+  { createdAt: 1 },
+  { expireAfterSeconds: 30 * 24 * 60 * 60 },
+);
+export const RecordingChunk = mongoose.model("RecordingChunk", recordingChunkSchema);

@@ -23,7 +23,12 @@ export async function createProject(
 
 export async function updateProject(
   id: string,
-  data: { name?: string; siteUrl?: string }
+  data: {
+    name?: string;
+    siteUrl?: string;
+    recordingEnabled?: boolean;
+    recordingSampleRate?: number;
+  },
 ) {
   return Project.findByIdAndUpdate(id, data, { returnDocument: "after" });
 }

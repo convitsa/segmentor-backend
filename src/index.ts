@@ -18,7 +18,7 @@ import adminRoutes from "./routes/admin.js";
 import visitorsRoutes from "./routes/visitors.js";
 import segiRoutes from "./routes/segi.js";
 import integrationsRoutes, { polarWebhookHandler } from "./routes/integrations.js";
-import recordingsRoutes, { publicRecordingRoute } from "./routes/recordings.js";
+import replaysRoutes from "./routes/replays.js";
 import { requireAuth } from "./auth/middleware.js";
 import { requireSubscription } from "./auth/require-subscription.js";
 import { requireAdmin } from "./auth/require-admin.js";
@@ -107,17 +107,6 @@ app.use(
   })
 );
 
-app.use(
-  "/public/recording",
-  rateLimiter({
-    windowMs: 60 * 1000,
-    limit: 60,
-    keyGenerator: (c) =>
-      c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-      c.req.header("x-real-ip") ||
-      "unknown",
-  })
-);
 
 app.route("/api/auth", authRoutes);
 app.route("/api/billing", billingRoutes);
@@ -138,12 +127,11 @@ protected_.route("", analyticsRoutes);
 protected_.route("", visitorsRoutes);
 protected_.route("", segiRoutes);
 protected_.route("", integrationsRoutes);
+protected_.route("", replaysRoutes);
 protected_.route("/uploads", uploadRoutes);
-protected_.route("", recordingsRoutes);
 app.route("/api", protected_);
 
 app.route("/public", publicRoutes);
-app.route("/public", publicRecordingRoute);
 app.route("/public", polarWebhookHandler);
 
 app.onError((err, c) => {

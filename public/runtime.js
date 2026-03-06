@@ -440,11 +440,79 @@
     trackPageview();
   }
 
+  /* ───── DOM CAPTURE ───── */
+  var _capStop = null;
+  var _capBuf = [];
+  var _capTimer = null;
+  var _CAP_MS = 5000;
+  var _capEnabled = false;
+
+  function startCapture() {
+    if (_capStop) return;
+    if (typeof rrwebRecord === "undefined") return;
+    _capEnabled = true;
+    _capStop = rrwebRecord({
+      emit: function (event) {
+        _capBuf.push(event);
+        if (!_capTimer) _capTimer = setTimeout(flushCapture, _CAP_MS);
+      },
+      maskAllInputs: true,
+      blockSelector: "[data-block]",
+      maskTextSelector: "[data-mask]",
+      sampling: {
+        mousemove: 50,
+        mouseInteraction: true,
+        scroll: 150,
+        input: "last",
+      },
+    });
+  }
+
+  function pauseCapture() {
+    if (_capStop) {
+      _capStop();
+      _capStop = null;
+    }
+    flushCapture();
+  }
+
+  function flushCapture() {
+    if (_capTimer) {
+      clearTimeout(_capTimer);
+      _capTimer = null;
+    }
+    if (!_capBuf.length) return;
+    var chunk = _capBuf.splice(0);
+    var seq = Date.now();
+    var payload = JSON.stringify({
+      projectKey: projectKey,
+      visitorId: visitorId,
+      sessionId: sessionId,
+      context: context,
+      geo: geoData,
+      events: [{ type: "s", d: chunk, seq: seq, ts: Date.now() }],
+    });
+    try {
+      fetch(baseUrl + "/public/ingest", {
+        method: "POST",
+        body: payload,
+        headers: { "Content-Type": "text/plain" },
+        credentials: "omit",
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
   /* ───── PAGE EXIT ───── */
   var sessionEndSent = false;
 
-  function onPageExit() {
-    stopRecording();
+  function onPageHidden() {
+    pauseCapture();
+    endCurrentPage();
+    flushEvents();
+  }
+
+  function onPageUnload() {
+    pauseCapture();
     endCurrentPage();
     if (!sessionEndSent) {
       sessionEndSent = true;
@@ -455,12 +523,13 @@
 
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "hidden") {
-      onPageExit();
+      onPageHidden();
     } else if (document.visibilityState === "visible") {
-      sessionEndSent = false;
+      if (_capEnabled && !_capStop) startCapture();
+      trackPageview();
     }
   });
-  window.addEventListener("pagehide", onPageExit);
+  window.addEventListener("pagehide", onPageUnload);
 
   /* ───── PUBLIC API ───── */
   window.segmentor = window.segmentor || {};
@@ -523,325 +592,6 @@
     document.addEventListener("DOMContentLoaded", observePolarLinks);
   } else {
     observePolarLinks();
-  }
-
-  /* ───── SESSION RECORDING (inline rrweb-compatible, zero deps) ───── */
-  var recordingActive = false;
-  var recordingChunks = [];
-  var recordingChunkIndex = 0;
-  var recordingFlushTimer = null;
-  var RECORDING_FLUSH_MS = 10000;
-  var RECORDING_MAX_DURATION_MS = 10 * 60 * 1000;
-  var recordingStartedAt = 0;
-  var recCleanups = [];
-
-  var _nid = 1;
-  var _nm = typeof WeakMap !== "undefined" ? new WeakMap() : null;
-  function _id(n) {
-    if (!_nm || !n) return 0;
-    if (_nm.has(n)) return _nm.get(n);
-    var id = _nid++;
-    _nm.set(n, id);
-    return id;
-  }
-
-  var _urlAttrs = { href: 1, src: 1, poster: 1, action: 1, "data-src": 1 };
-  function _abs(u) {
-    if (!u || u.charAt(0) === "#" || u.indexOf("data:") === 0 || u.indexOf("blob:") === 0 || u.indexOf("javascript:") === 0) return u;
-    try { return new URL(u, document.baseURI).href; } catch (e) { return u; }
-  }
-
-  function _sn(n) {
-    if (!n) return null;
-    var id = _id(n);
-    var t = n.nodeType;
-    if (t === 9) return { type: 0, childNodes: _sc(n), id: id };
-    if (t === 10) return { type: 1, name: n.name || "", publicId: n.publicId || "", systemId: n.systemId || "", id: id };
-    if (t === 3) {
-      var pTag = n.parentElement ? n.parentElement.tagName : "";
-      var r = { type: 3, textContent: n.textContent || "", id: id };
-      if (pTag === "STYLE") r.isStyle = true;
-      return r;
-    }
-    if (t === 8) return { type: 5, textContent: n.textContent || "", id: id };
-    if (t !== 1) return null;
-
-    var tag = n.tagName.toLowerCase();
-    if (tag === "script" || tag === "noscript") return null;
-
-    var attrs = {};
-    for (var i = 0; i < n.attributes.length; i++) {
-      var a = n.attributes[i];
-      if (a.name.length > 2 && a.name.indexOf("on") === 0) continue;
-      attrs[a.name] = _urlAttrs[a.name] ? _abs(a.value) : a.value;
-    }
-
-    if (tag === "input") {
-      var itype = (n.type || "text").toLowerCase();
-      if (itype === "password") attrs.value = "***";
-      else if (itype === "checkbox" || itype === "radio") { if (n.checked) attrs.checked = ""; else delete attrs.checked; }
-      else attrs.value = n.value || "";
-    }
-    if (tag === "textarea") attrs.value = n.value || "";
-    if (tag === "select") attrs.value = n.value || "";
-    if (tag === "option" && n.selected) attrs.selected = "";
-
-    if (tag === "link" && attrs.rel === "stylesheet" && n.sheet) {
-      try {
-        var rules = n.sheet.cssRules || n.sheet.rules;
-        if (rules && rules.length) {
-          var css = "";
-          for (var r = 0; r < rules.length; r++) css += rules[r].cssText + "\n";
-          return { type: 2, tagName: "style", attributes: {}, childNodes: [{ type: 3, textContent: css, id: _nid++, isStyle: true }], id: id };
-        }
-      } catch (e) {}
-    }
-    if (tag === "canvas") {
-      try { var du = n.toDataURL(); return { type: 2, tagName: "img", attributes: { src: du, width: String(n.width), height: String(n.height) }, childNodes: [], id: id }; } catch (e) {}
-    }
-
-    var res = { type: 2, tagName: tag, attributes: attrs, childNodes: _sc(n), id: id };
-    if (n instanceof SVGElement) res.isSVG = true;
-    return res;
-  }
-
-  function _sc(n) {
-    var c = [], ch = n.firstChild;
-    while (ch) { var s = _sn(ch); if (s) c.push(s); ch = ch.nextSibling; }
-    return c;
-  }
-
-  function recEmit(evt) {
-    if (!recordingActive) return;
-    evt.timestamp = Date.now();
-    recordingChunks.push(evt);
-  }
-
-  function getSelector(el) {
-    if (!el || !el.tagName) return "";
-    if (el.id) return "#" + el.id;
-    var path = [], cur = el;
-    while (cur && cur !== document.body && cur !== document.documentElement && path.length < 5) {
-      var tag = cur.tagName.toLowerCase();
-      if (cur.id) { path.unshift("#" + cur.id); break; }
-      var cls = "";
-      if (cur.className && typeof cur.className === "string") cls = cur.className.trim().split(/\s+/).slice(0, 2).map(function (c) { return "." + c; }).join("");
-      path.unshift(tag + cls);
-      cur = cur.parentElement;
-    }
-    return path.join(" > ") || "body";
-  }
-
-  function flushRecordingChunk(isFinal) {
-    if (!recordingChunks.length && !isFinal) return;
-    var chunk = recordingChunks.slice();
-    recordingChunks = [];
-    var idx = recordingChunkIndex++;
-    var payload = JSON.stringify({
-      projectKey: projectKey, visitorId: visitorId, sessionId: sessionId,
-      chunk: chunk, chunkIndex: idx, isFinal: !!isFinal,
-    });
-    console.log("[Segmentor] Flushing recording chunk #" + idx + " (" + chunk.length + " events, final=" + isFinal + ")");
-    try {
-      fetch(baseUrl + "/public/recording", {
-        method: "POST", body: payload,
-        headers: { "Content-Type": "application/json" },
-        credentials: "omit", keepalive: true,
-      }).then(function (res) {
-        if (!res.ok) console.warn("[Segmentor] Recording chunk upload failed: " + res.status);
-      }).catch(function () {
-        try { if (navigator.sendBeacon) navigator.sendBeacon(baseUrl + "/public/recording", new Blob([payload], { type: "application/json" })); } catch (e2) {}
-      });
-    } catch (e) {
-      try { if (navigator.sendBeacon) navigator.sendBeacon(baseUrl + "/public/recording", new Blob([payload], { type: "application/json" })); } catch (e2) {}
-    }
-  }
-
-  function scheduleRecordingFlush() {
-    if (recordingFlushTimer) return;
-    recordingFlushTimer = setInterval(function () {
-      if (!recordingActive) return;
-      if (Date.now() - recordingStartedAt > RECORDING_MAX_DURATION_MS) {
-        console.log("[Segmentor] Max recording duration reached, stopping");
-        stopRecording();
-        return;
-      }
-      flushRecordingChunk(false);
-    }, RECORDING_FLUSH_MS);
-  }
-
-  function stopRecording() {
-    if (!recordingActive) return;
-    recordingActive = false;
-    console.log("[Segmentor] Stopping recording");
-    recCleanups.forEach(function (fn) { try { fn(); } catch (e) {} });
-    recCleanups = [];
-    if (recordingFlushTimer) { clearInterval(recordingFlushTimer); recordingFlushTimer = null; }
-    flushRecordingChunk(true);
-  }
-
-  function startRecording() {
-    if (recordingActive) return;
-    console.log("[Segmentor] Starting session recording");
-    recordingActive = true;
-    recordingStartedAt = Date.now();
-    recordingChunks = [];
-    recordingChunkIndex = 0;
-    recCleanups = [];
-    _nid = 1;
-    _nm = typeof WeakMap !== "undefined" ? new WeakMap() : null;
-
-    function addRec(target, event, fn, opts) {
-      target.addEventListener(event, fn, opts || false);
-      recCleanups.push(function () { target.removeEventListener(event, fn, opts || false); });
-    }
-
-    recEmit({ type: 4, data: { href: window.location.href, width: window.innerWidth, height: window.innerHeight } });
-
-    try {
-      var snap = _sn(document);
-      if (snap) recEmit({ type: 2, data: { node: snap, initialOffset: { left: window.pageXOffset || 0, top: window.pageYOffset || 0 } } });
-    } catch (e) { console.warn("[Segmentor] Snapshot failed:", e); }
-
-    if (typeof MutationObserver !== "undefined") {
-      var mo = new MutationObserver(function (muts) {
-        if (!recordingActive) return;
-        var adds = [], rems = [], txts = [], atrs = [];
-        for (var i = 0; i < muts.length; i++) {
-          var m = muts[i];
-          if (m.type === "childList") {
-            for (var j = 0; j < m.removedNodes.length; j++) {
-              var rn = m.removedNodes[j];
-              if (rn.tagName && (rn.tagName === "SCRIPT" || rn.tagName === "NOSCRIPT")) continue;
-              if (_nm && _nm.has(rn)) rems.push({ parentId: _id(m.target), id: _nm.get(rn) });
-            }
-            for (var k = 0; k < m.addedNodes.length; k++) {
-              var an = m.addedNodes[k];
-              if (an.tagName && (an.tagName === "SCRIPT" || an.tagName === "NOSCRIPT")) continue;
-              var ser = _sn(an);
-              if (ser) {
-                var nx = an.nextSibling;
-                adds.push({ parentId: _id(m.target), node: ser, nextId: nx && _nm && _nm.has(nx) ? _nm.get(nx) : null });
-              }
-            }
-          }
-          if (m.type === "attributes" && m.target.nodeType === 1) {
-            var an2 = m.attributeName;
-            if (an2 && !(an2.length > 2 && an2.indexOf("on") === 0)) {
-              var av = m.target.getAttribute(an2);
-              var ao = {};
-              ao[an2] = av;
-              atrs.push({ id: _id(m.target), attributes: ao });
-            }
-          }
-          if (m.type === "characterData") txts.push({ id: _id(m.target), value: m.target.textContent || "" });
-        }
-        if (adds.length || rems.length || txts.length || atrs.length) {
-          recEmit({ type: 3, data: { source: 0, texts: txts, attributes: atrs, removes: rems, adds: adds } });
-        }
-      });
-      mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
-      recCleanups.push(function () { mo.disconnect(); });
-    }
-
-    var moveBuffer = [];
-    var moveTimer = null;
-    function flushMoves() {
-      moveTimer = null;
-      if (moveBuffer.length > 0 && recordingActive) {
-        recEmit({ type: 3, data: { source: 1, positions: moveBuffer.slice(-30) } });
-        moveBuffer = [];
-      }
-    }
-    addRec(document, "mousemove", function (e) {
-      moveBuffer.push({ x: e.clientX, y: e.clientY, id: _id(e.target || document.documentElement), timeOffset: 0 });
-      if (!moveTimer) moveTimer = setTimeout(flushMoves, 500);
-    }, { passive: true });
-    recCleanups.push(function () { if (moveTimer) clearTimeout(moveTimer); });
-
-    addRec(document, "touchmove", function (e) {
-      if (e.touches && e.touches.length) {
-        var tc = e.touches[0];
-        moveBuffer.push({ x: tc.clientX, y: tc.clientY, id: _id(e.target || document.documentElement), timeOffset: 0 });
-        if (!moveTimer) moveTimer = setTimeout(flushMoves, 500);
-      }
-    }, { passive: true });
-
-    addRec(document, "click", function (e) {
-      var t = e.target;
-      if (!t) return;
-      var el = t.closest ? t.closest("a, button, [role='button'], input[type='submit'], [onclick]") : null;
-      if (!el) el = t;
-      var text = "";
-      try { text = (el.textContent || el.value || el.getAttribute("aria-label") || "").trim().substring(0, 120); } catch (ex) {}
-      recEmit({
-        type: 3,
-        data: {
-          source: 2, type: 2,
-          id: _id(el), x: e.clientX, y: e.clientY,
-          __text: text, __selector: getSelector(el), __tag: (el.tagName || "").toLowerCase(),
-        },
-      });
-    }, true);
-
-    addRec(document, "mousedown", function (e) {
-      recEmit({ type: 3, data: { source: 2, type: 1, id: _id(e.target || document.documentElement), x: e.clientX, y: e.clientY } });
-    }, true);
-    addRec(document, "mouseup", function (e) {
-      recEmit({ type: 3, data: { source: 2, type: 0, id: _id(e.target || document.documentElement), x: e.clientX, y: e.clientY } });
-    }, true);
-
-    var scrollTimer = null;
-    var docElId = _id(document.documentElement);
-    addRec(window, "scroll", function () {
-      if (scrollTimer) return;
-      scrollTimer = setTimeout(function () {
-        scrollTimer = null;
-        recEmit({ type: 3, data: { source: 3, id: docElId, x: window.pageXOffset || 0, y: window.pageYOffset || 0 } });
-      }, 200);
-    }, { passive: true });
-    recCleanups.push(function () { if (scrollTimer) clearTimeout(scrollTimer); });
-
-    addRec(window, "resize", function () {
-      recEmit({ type: 3, data: { source: 4, width: window.innerWidth, height: window.innerHeight } });
-    });
-
-    var inputTimers = {};
-    addRec(document, "input", function (e) {
-      var el = e.target;
-      if (!el || !el.tagName) return;
-      var nid = _id(el);
-      var key = "n" + nid;
-      if (inputTimers[key]) clearTimeout(inputTimers[key]);
-      inputTimers[key] = setTimeout(function () {
-        delete inputTimers[key];
-        var itype = (el.type || "").toLowerCase();
-        recEmit({ type: 3, data: { source: 5, id: nid, text: itype === "password" ? "***" : (el.value || ""), isChecked: !!el.checked } });
-      }, 300);
-    }, true);
-    recCleanups.push(function () { Object.keys(inputTimers).forEach(function (k) { clearTimeout(inputTimers[k]); }); });
-
-    var lastRecUrl = window.location.href;
-    var urlCheck = setInterval(function () {
-      if (!recordingActive) return;
-      var cur = window.location.href;
-      if (cur !== lastRecUrl) {
-        lastRecUrl = cur;
-        recEmit({ type: 4, data: { href: cur, width: window.innerWidth, height: window.innerHeight } });
-      }
-    }, 1000);
-    recCleanups.push(function () { clearInterval(urlCheck); });
-
-    scheduleRecordingFlush();
-  }
-
-  function initRecording(config) {
-    if (!config || !config.recordingEnabled) {
-      console.log("[Segmentor] Recording disabled for this project");
-      return;
-    }
-    console.log("[Segmentor] Initializing session recording");
-    startRecording();
   }
 
   /* ───── PERSONALIZATION ENGINE ───── */
@@ -933,7 +683,13 @@
         geoData = geo;
 
         trackPageview();
-        initRecording(config);
+
+        if (config && config.sr && typeof rrwebRecord !== "undefined") {
+          var srs = typeof config.srs === "number" ? config.srs : 1;
+          if (Math.random() < srs) {
+            startCapture();
+          }
+        }
 
         if (!config || !config.elements || !config.elements.length) {
           clearTimeout(foucTimer);

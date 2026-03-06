@@ -80,6 +80,7 @@ export async function getProjectConfig(
     id: project.id,
     siteUrl: project.siteUrl,
     elements,
-    recordingEnabled: project.recordingEnabled ?? false,
+    sr: !!(project as any).recordingEnabled,
+    srs: (project as any).recordingSampleRate ?? 1,
   };
 }

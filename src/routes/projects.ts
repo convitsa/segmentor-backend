@@ -43,6 +43,8 @@ projects.get("/:id", async (c) => {
 const updateSchema = z.object({
   name: z.string().min(1).optional(),
   siteUrl: z.string().url().optional(),
+  recordingEnabled: z.boolean().optional(),
+  recordingSampleRate: z.number().min(0).max(1).optional(),
 });
 
 projects.patch("/:id", async (c) => {
