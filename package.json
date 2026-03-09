@@ -19,6 +19,7 @@
     "mime-types": "^3.0.2",
     "mongoose": "^9.2.3",
     "nanoid": "^5.1.2",
+    "node-html-parser": "^7.1.0",
     "openai": "^6.25.0",
     "posthog-node": "^5.25.0",
     "resend": "^6.9.2",

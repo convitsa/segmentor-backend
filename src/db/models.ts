@@ -312,6 +312,7 @@ const segiConversationSchema = new Schema(
   {
     projectId: { type: Schema.Types.ObjectId, required: true },
     title: String,
+    recordingSessionId: String,
   },
   opts("SegiConversation", true),
 );

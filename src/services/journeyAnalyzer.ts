@@ -1,6 +1,7 @@
 import { AzureOpenAI } from "openai";
 import { gunzipSync } from "zlib";
-import { Recording, RecordingChunk } from "../db/models.js";
+import { Recording, RecordingChunk, Visitor } from "../db/models.js";
+import { friendlyName } from "../lib/friendly-name.js";
 
 // rrweb enums
 const EventType = { FullSnapshot: 2, IncrementalSnapshot: 3, Meta: 4 } as const;
@@ -122,10 +123,87 @@ function getClient(): AzureOpenAI | null {
   return new AzureOpenAI({ endpoint, apiKey, apiVersion: "2024-08-01-preview" });
 }
 
-export async function analyzeRecording(
+export interface SessionAnalysis {
+  metadata: {
+    visitor: string;
+    location: string;
+    device: string;
+    browser: string;
+    date: string;
+    verdict: string;
+    verdictType: "positive" | "warning" | "negative";
+  };
+  activityOverview: {
+    sessions: number;
+    pageviews: number;
+    rageClicks: number;
+    timeOnSite: string;
+  };
+  frictionScore: {
+    score: number;
+    level: "low" | "medium" | "high";
+    description: string;
+  };
+  frictionPoints: Array<{
+    severity: "red" | "orange" | "yellow";
+    text: string;
+  }>;
+  visitorJourney: string[];
+  recommendations: Array<{
+    title: string;
+    description: string;
+  }>;
+  verdict: {
+    summary: string;
+  };
+}
+
+function formatTimeOnSite(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function extractPageviews(actions: UserAction[]): string[] {
+  const pages: string[] = [];
+  for (const a of actions) {
+    if (a.action.startsWith("Navigated to ")) {
+      try {
+        const url = new URL(a.action.replace("Navigated to ", ""));
+        pages.push(url.pathname);
+      } catch {
+        pages.push(a.action.replace("Navigated to ", ""));
+      }
+    }
+  }
+  return pages;
+}
+
+function countRageClicks(actions: UserAction[]): number {
+  let count = 0;
+  for (let i = 0; i < actions.length; i++) {
+    if (!actions[i].action.startsWith("Clicked")) continue;
+    let rapid = 1;
+    for (let j = i + 1; j < actions.length; j++) {
+      if (!actions[j].action.startsWith("Clicked")) break;
+      if (actions[j].time - actions[i].time > 3) break;
+      rapid++;
+    }
+    if (rapid >= 3) count++;
+  }
+  return count;
+}
+
+export async function analyzeRecordingStructured(
   projectId: string,
   sessionId: string,
-): Promise<string | null> {
+): Promise<SessionAnalysis | null> {
+  const recording = await Recording.findOne({ projectId, sessionId }).lean() as any;
+  if (!recording) return null;
+
   const chunks = await RecordingChunk.find({ projectId, sessionId })
     .sort({ seqNum: 1 })
     .lean();
@@ -147,29 +225,111 @@ export async function analyzeRecording(
   if (actions.length === 0) return null;
 
   const timeline = formatTimeline(actions);
+  const pages = extractPageviews(actions);
+  const rageClicks = countRageClicks(actions);
+
+  const start = recording.startedAt ? new Date(recording.startedAt).getTime() : 0;
+  const end = recording.endedAt ? new Date(recording.endedAt).getTime() : Date.now();
+  const durationSec = start ? Math.max(0, Math.round((end - start) / 1000)) : 0;
+
+  const visitor = await Visitor.findOne(
+    { projectId, visitorId: recording.visitorId },
+    { visitorId: 1, email: 1, name: 1 },
+  ).lean() as any;
+
+  const visitorName = visitor?.name || visitor?.email || friendlyName(recording.visitorId);
+
+  const activityOverview = {
+    sessions: 1,
+    pageviews: pages.length || recording.pageCount || 0,
+    rageClicks,
+    timeOnSite: formatTimeOnSite(durationSec),
+  };
+
+  const metadata = {
+    visitor: visitorName,
+    location: recording.country || "Unknown",
+    device: recording.device || "Unknown",
+    browser: recording.browser || "Unknown",
+    date: recording.startedAt ? new Date(recording.startedAt).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }) : "Unknown",
+    verdict: "",
+    verdictType: "warning" as const,
+  };
 
   const client = getClient();
   if (!client) return null;
 
   const deployment = process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4o-mini";
 
+  const systemPrompt = `You are a UX analyst. Given a timestamped timeline of a user's session on a website, analyze the session and return ONLY valid JSON (no markdown, no code fences) matching this exact schema:
+
+{
+  "verdict": { "text": "string — e.g. 'High Intent — Did Not Convert'", "type": "positive|warning|negative" },
+  "frictionScore": { "score": 0-100, "level": "low|medium|high", "description": "one sentence explaining the score" },
+  "frictionPoints": [{ "severity": "red|orange|yellow", "text": "description of the friction point" }],
+  "recommendations": [{ "title": "short title", "description": "actionable recommendation" }],
+  "verdictSummary": "one sentence — the single most important takeaway from this session"
+}
+
+Guidelines:
+- frictionScore: 0-30 = low, 31-60 = medium, 61-100 = high
+- frictionPoints: red = critical, orange = moderate, yellow = minor. Include 2-5 points.
+- recommendations: 2-4 actionable items ranked by impact.
+- verdict text should be a concise label like "High Intent — Did Not Convert" or "Engaged Browser — Converted" etc.
+- verdictSummary should be a plain-language sentence about the key takeaway.`;
+
   const response = await client.chat.completions.create({
     model: deployment,
     messages: [
-      {
-        role: "system",
-        content: `You are a UX analyst. Given a timestamped timeline of a user's actions on a website, write a clear, concise summary of their journey. Describe step by step what the user did, their likely intent, and any notable behavior patterns (hesitation, exploration, drop-off). Use natural language, not bullet points. Keep it to 2-4 short paragraphs. Do not speculate beyond what the data shows.`,
-      },
-      {
-        role: "user",
-        content: `Here is the user's session timeline:\n\n${timeline}`,
-      },
+      { role: "system", content: systemPrompt },
+      { role: "user", content: `Session timeline:\n\n${timeline}\n\nSession metadata: Duration ${formatTimeOnSite(durationSec)}, ${recording.clickCount || 0} clicks, ${rageClicks} rage clicks, ${pages.length} pages visited, Device: ${recording.device || "unknown"}, Browser: ${recording.browser || "unknown"}, Country: ${recording.country || "unknown"}` },
     ],
-    max_tokens: 600,
+    max_tokens: 1200,
     temperature: 0.3,
   });
 
-  return response.choices[0]?.message?.content?.trim() || null;
+  const raw = response.choices[0]?.message?.content?.trim() || "";
+
+  try {
+    const parsed = JSON.parse(raw);
+
+    metadata.verdict = parsed.verdict?.text || "Session Analyzed";
+    metadata.verdictType = parsed.verdict?.type || "warning";
+
+    return {
+      metadata,
+      activityOverview,
+      frictionScore: {
+        score: parsed.frictionScore?.score ?? 50,
+        level: parsed.frictionScore?.level || "medium",
+        description: parsed.frictionScore?.description || "",
+      },
+      frictionPoints: (parsed.frictionPoints || []).map((fp: any) => ({
+        severity: fp.severity || "yellow",
+        text: fp.text || "",
+      })),
+      visitorJourney: pages.length > 0 ? pages : ["/"],
+      recommendations: (parsed.recommendations || []).map((r: any) => ({
+        title: r.title || "",
+        description: r.description || "",
+      })),
+      verdict: {
+        summary: parsed.verdictSummary || "Session analysis complete.",
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Legacy plain-text analyzer kept for backward compatibility
+export async function analyzeRecording(
+  projectId: string,
+  sessionId: string,
+): Promise<string | null> {
+  const result = await analyzeRecordingStructured(projectId, sessionId);
+  if (!result) return null;
+  return result.verdict.summary;
 }
 
 export async function analyzeAndStore(

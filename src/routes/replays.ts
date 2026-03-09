@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { gunzipSync } from "zlib";
 import { requireAuth } from "../auth/middleware.js";
 import { requireProjectOwnership } from "../lib/ownership.js";
-import { Recording, RecordingChunk, Visitor } from "../db/models.js";
+import { Recording, RecordingChunk, Visitor, SegiConversation, SegiMessage } from "../db/models.js";
 import { friendlyName } from "../lib/friendly-name.js";
 import { analyzeAndStore } from "../services/journeyAnalyzer.js";
 
@@ -187,6 +187,42 @@ replays.post("/projects/:projectId/replays/:sessionId/analyze", async (c) => {
   if (!summary) return c.json({ error: "Analysis failed — AI may not be configured" }, 503);
 
   return c.json({ journeySummary: summary });
+});
+
+replays.post("/projects/:projectId/replays/:sessionId/analyze-chat", async (c) => {
+  const userId = c.get("userId");
+  const projectId = c.req.param("projectId");
+  const sessionId = c.req.param("sessionId");
+  await requireProjectOwnership(projectId, userId);
+
+  const recording = await Recording.findOne({ projectId, sessionId }).lean() as any;
+  if (!recording) return c.json({ error: "Recording not found" }, 404);
+
+  const existing = await SegiConversation.findOne({ projectId, recordingSessionId: sessionId }).lean() as any;
+  if (existing) {
+    const aiResponse = await SegiMessage.findOne({
+      conversationId: existing._id,
+      role: "assistant",
+    }).lean();
+    if (!aiResponse) {
+      await SegiMessage.deleteMany({ conversationId: existing._id });
+    }
+    return c.json({ conversationId: existing._id.toString() });
+  }
+
+  const v = await Visitor.findOne(
+    { projectId, visitorId: recording.visitorId },
+    { visitorId: 1, email: 1, name: 1 },
+  ).lean() as any;
+  const visitorName = v?.name || v?.email || friendlyName(recording.visitorId);
+
+  const conversation = await SegiConversation.create({
+    projectId,
+    title: `Session Analysis — ${visitorName}`,
+    recordingSessionId: sessionId,
+  });
+
+  return c.json({ conversationId: conversation._id.toString() });
 });
 
 replays.delete("/projects/:projectId/replays/:sessionId", async (c) => {
