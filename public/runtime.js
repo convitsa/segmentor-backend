@@ -384,9 +384,36 @@
   window.addEventListener("scroll", onScroll, { passive: true });
 
   /* ───── CLICK TRACKING ───── */
+  function getSelector(el) {
+    if (!el || !el.tagName) return "";
+    var parts = [];
+    var cur = el;
+    for (var i = 0; i < 5 && cur && cur !== document.body && cur !== document.documentElement; i++) {
+      var tag = cur.tagName.toLowerCase();
+      if (cur.id) { parts.unshift(tag + "#" + cur.id); break; }
+      var cls = (cur.className && typeof cur.className === "string") ? "." + cur.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
+      parts.unshift(tag + cls);
+      cur = cur.parentElement;
+    }
+    return parts.join(" > ").substring(0, 200);
+  }
+
   document.addEventListener("click", function (e) {
     var target = e.target;
     if (!target || !target.tagName) return;
+
+    queueEvent({
+      type: "hm_click",
+      url: window.location.pathname + window.location.search,
+      properties: {
+        x: e.clientX / (window.innerWidth || 1),
+        y: (e.clientY + (window.pageYOffset || document.documentElement.scrollTop)) / (Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) || 1),
+        vw: window.innerWidth,
+        vh: window.innerHeight,
+        sel: getSelector(target),
+      },
+    });
+
     var el = target.closest("a, button, [role='button'], input[type='submit']");
     if (!el) return;
 
@@ -404,6 +431,66 @@
       },
     });
   }, true);
+
+  /* ───── HEATMAP: MOUSE MOVE ───── */
+  var _hmMoveBuf = [];
+  var _hmMoveTimer = null;
+  var _HM_MOVE_MS = 3000;
+
+  document.addEventListener("mousemove", function (e) {
+    var now = Date.now();
+    if (_hmMoveBuf.length > 0 && now - _hmMoveBuf[_hmMoveBuf.length - 1].t < 100) return;
+    _hmMoveBuf.push({
+      x: e.clientX / (window.innerWidth || 1),
+      y: (e.clientY + (window.pageYOffset || document.documentElement.scrollTop)) / (Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) || 1),
+      t: now,
+    });
+    if (!_hmMoveTimer) {
+      _hmMoveTimer = setTimeout(function () {
+        _hmMoveTimer = null;
+        if (!_hmMoveBuf.length) return;
+        var batch = _hmMoveBuf.splice(0);
+        queueEvent({
+          type: "hm_move",
+          url: window.location.pathname + window.location.search,
+          properties: {
+            points: batch,
+            vw: window.innerWidth,
+            vh: window.innerHeight,
+          },
+        });
+      }, _HM_MOVE_MS);
+    }
+  }, { passive: true });
+
+  /* ───── HEATMAP: SCROLL DEPTH ───── */
+  var _hmScrollLast = -1;
+  var _hmScrollTimer = null;
+
+  function onHmScroll() {
+    if (_hmScrollTimer) return;
+    _hmScrollTimer = setTimeout(function () {
+      _hmScrollTimer = null;
+      var scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+      var docHeight = Math.max(
+        document.body.scrollHeight, document.documentElement.scrollHeight,
+        document.body.offsetHeight, document.documentElement.offsetHeight
+      );
+      var winHeight = window.innerHeight;
+      if (docHeight <= winHeight) return;
+      var depth = Math.round((scrollTop + winHeight) / docHeight * 100);
+      var band = Math.floor(depth / 10) * 10;
+      if (band !== _hmScrollLast) {
+        _hmScrollLast = band;
+        queueEvent({
+          type: "hm_scroll",
+          url: window.location.pathname + window.location.search,
+          properties: { depth: depth, vw: window.innerWidth, vh: window.innerHeight },
+        });
+      }
+    }, 500);
+  }
+  window.addEventListener("scroll", onHmScroll, { passive: true });
 
   /* ───── FORM TRACKING ───── */
   document.addEventListener("submit", function (e) {
@@ -444,8 +531,10 @@
   var _capStop = null;
   var _capBuf = [];
   var _capTimer = null;
-  var _CAP_MS = 5000;
+  var _CAP_MS = 3000;
+  var _CAP_MAX_BUF = 200;
   var _capEnabled = false;
+  var _cbSentIdx = 0;
 
   function startCapture() {
     if (_capStop) return;
@@ -454,16 +543,35 @@
     _capStop = rrwebRecord({
       emit: function (event) {
         _capBuf.push(event);
-        if (!_capTimer) _capTimer = setTimeout(flushCapture, _CAP_MS);
+        if (_capBuf.length >= _CAP_MAX_BUF) {
+          flushCapture();
+        } else if (!_capTimer) {
+          _capTimer = setTimeout(flushCapture, _CAP_MS);
+        }
       },
       maskAllInputs: true,
       blockSelector: "[data-block]",
       maskTextSelector: "[data-mask]",
+      checkoutEveryNms: 30000,
+      recordCanvas: false,
+      inlineImages: false,
+      collectFonts: false,
       sampling: {
-        mousemove: 50,
+        mousemove: 300,
         mouseInteraction: true,
-        scroll: 150,
+        scroll: 300,
         input: "last",
+      },
+      slimDOMOptions: {
+        script: true,
+        comment: true,
+        headFavicon: true,
+        headWhitespace: true,
+        headMetaSocial: true,
+        headMetaRobots: true,
+        headMetaHttpEquiv: true,
+        headMetaAuthorship: true,
+        headMetaVerification: true,
       },
     });
   }
@@ -483,23 +591,129 @@
     }
     if (!_capBuf.length) return;
     var chunk = _capBuf.splice(0);
+    _cbSentIdx = 0;
     var seq = Date.now();
-    var payload = JSON.stringify({
-      projectKey: projectKey,
-      visitorId: visitorId,
-      sessionId: sessionId,
-      context: context,
-      geo: geoData,
-      events: [{ type: "s", d: chunk, seq: seq, ts: Date.now() }],
+    var defer = typeof requestIdleCallback === "function" ? requestIdleCallback : function (fn) { setTimeout(fn, 0); };
+    defer(function () {
+      try {
+        var payload = JSON.stringify({
+          projectKey: projectKey,
+          visitorId: visitorId,
+          sessionId: sessionId,
+          context: context,
+          geo: geoData,
+          events: [{ type: "s", d: chunk, seq: seq, ts: Date.now() }],
+        });
+        fetch(baseUrl + "/public/ingest", {
+          method: "POST",
+          body: payload,
+          headers: { "Content-Type": "text/plain" },
+          credentials: "omit",
+        }).catch(function () {});
+      } catch (e) {}
     });
+  }
+
+  /* ───── VISITOR WEBSOCKET + CO-BROWSE ───── */
+  var _visWs = null;
+  var _visWsReconnectDelay = 1000;
+  var _visWsDisposed = false;
+  var _cbActive = false;
+  var _cbAgentCursor = null;
+  var _cbStreamTimer = null;
+
+  function visWsConnect() {
+    if (_visWsDisposed || _visWs) return;
+    var wsProtocol = baseUrl.indexOf("https") === 0 ? "wss" : "ws";
+    var wsBase = baseUrl.replace(/^https?/, wsProtocol);
+    var wsUrl = wsBase + "/ws/visitor?sessionId=" + encodeURIComponent(sessionId) + "&projectKey=" + encodeURIComponent(projectKey);
+
     try {
-      fetch(baseUrl + "/public/ingest", {
-        method: "POST",
-        body: payload,
-        headers: { "Content-Type": "text/plain" },
-        credentials: "omit",
-      }).catch(function () {});
-    } catch (e) {}
+      _visWs = new WebSocket(wsUrl);
+    } catch (e) { _visWs = null; return; }
+
+    _visWs.onopen = function () {
+      _visWsReconnectDelay = 1000;
+    };
+
+    _visWs.onmessage = function (e) {
+      try {
+        var msg = JSON.parse(e.data);
+        if (msg.type === "cobrowse:request") cbStartStreaming();
+        else if (msg.type === "cobrowse:end") cbStopStreaming();
+        else if (msg.type === "cb_cursor") cbShowAgentCursor(msg);
+        else if (msg.type === "cb_highlight") cbShowHighlight(msg);
+        else if (msg.type === "cb_agent_joined" && _cbActive) {
+          _visWs.send(JSON.stringify({ type: "cb_visitor_ready" }));
+        }
+      } catch (err) {}
+    };
+
+    _visWs.onclose = function () {
+      _visWs = null;
+      if (_cbActive) cbStopStreaming();
+      if (!_visWsDisposed) {
+        setTimeout(visWsConnect, _visWsReconnectDelay);
+        _visWsReconnectDelay = Math.min(_visWsReconnectDelay * 2, 10000);
+      }
+    };
+
+    _visWs.onerror = function () {
+      if (_visWs) _visWs.close();
+    };
+  }
+
+  function cbStartStreaming() {
+    if (_cbActive) return;
+    _cbActive = true;
+    _cbSentIdx = _capBuf.length;
+    if (_visWs && _visWs.readyState === 1) {
+      _visWs.send(JSON.stringify({ type: "cb_visitor_ready" }));
+    }
+    if (typeof rrwebRecord !== "undefined" && !_capStop) {
+      startCapture();
+    }
+    if (!_cbStreamTimer) {
+      _cbStreamTimer = setInterval(function () {
+        if (!_cbActive || !_visWs || _visWs.readyState !== 1) return;
+        if (_capBuf.length > _cbSentIdx) {
+          var newEvents = _capBuf.slice(_cbSentIdx);
+          _cbSentIdx = _capBuf.length;
+          _visWs.send(JSON.stringify({ type: "cb_rrweb", events: newEvents }));
+        }
+      }, 200);
+    }
+  }
+
+  function cbStopStreaming() {
+    _cbActive = false;
+    if (_cbStreamTimer) { clearInterval(_cbStreamTimer); _cbStreamTimer = null; }
+    cbRemoveAgentCursor();
+  }
+
+  function cbShowAgentCursor(msg) {
+    if (!_cbAgentCursor) {
+      _cbAgentCursor = document.createElement("div");
+      _cbAgentCursor.style.cssText = "position:fixed;width:20px;height:20px;border-radius:50%;background:rgba(99,102,241,0.7);pointer-events:none;z-index:999999;transition:all 0.1s ease;box-shadow:0 0 8px rgba(99,102,241,0.4);";
+      document.body.appendChild(_cbAgentCursor);
+    }
+    _cbAgentCursor.style.left = (msg.x * window.innerWidth - 10) + "px";
+    _cbAgentCursor.style.top = (msg.y * window.innerHeight - 10) + "px";
+  }
+
+  function cbShowHighlight(msg) {
+    var el = msg.selector ? document.querySelector(msg.selector) : null;
+    if (!el) return;
+    var prev = el.style.outline;
+    el.style.outline = "3px solid rgba(99,102,241,0.8)";
+    setTimeout(function () { el.style.outline = prev; }, 2000);
+  }
+
+  function cbRemoveAgentCursor() {
+    if (_cbAgentCursor && _cbAgentCursor.parentNode) {
+      _cbAgentCursor.parentNode.removeChild(_cbAgentCursor);
+    }
+    _cbAgentCursor = null;
   }
 
   /* ───── PAGE EXIT ───── */
@@ -519,6 +733,8 @@
       queueEvent({ type: "session_end" });
     }
     flushEvents();
+    _visWsDisposed = true;
+    if (_visWs) { try { _visWs.close(); } catch (e) {} _visWs = null; }
   }
 
   document.addEventListener("visibilitychange", function () {
@@ -707,4 +923,9 @@
   }
 
   fetchAndApply();
+
+  // Open persistent visitor WebSocket for instant cobrowse signaling
+  if (typeof WebSocket !== "undefined") {
+    visWsConnect();
+  }
 })();

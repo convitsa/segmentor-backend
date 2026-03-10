@@ -19,6 +19,8 @@ import visitorsRoutes from "./routes/visitors.js";
 import segiRoutes from "./routes/segi.js";
 import integrationsRoutes, { polarWebhookHandler } from "./routes/integrations.js";
 import replaysRoutes from "./routes/replays.js";
+import heatmapsRoutes from "./routes/heatmaps.js";
+import cobrowseRoutes from "./routes/cobrowse.js";
 import { requireAuth } from "./auth/middleware.js";
 import { requireSubscription } from "./auth/require-subscription.js";
 import { requireAdmin } from "./auth/require-admin.js";
@@ -128,6 +130,8 @@ protected_.route("", visitorsRoutes);
 protected_.route("", segiRoutes);
 protected_.route("", integrationsRoutes);
 protected_.route("", replaysRoutes);
+protected_.route("", heatmapsRoutes);
+protected_.route("", cobrowseRoutes);
 protected_.route("/uploads", uploadRoutes);
 app.route("/api", protected_);
 
@@ -168,7 +172,8 @@ Bun.serve({
   port: PORT,
   fetch(req, server) {
     const wsResponse = handleWsUpgrade(req, server);
-    if (wsResponse === undefined && new URL(req.url).pathname === "/ws") {
+    const pathname = new URL(req.url).pathname;
+    if (wsResponse === undefined && (pathname === "/ws" || pathname === "/ws/visitor")) {
       return undefined as any;
     }
     if (wsResponse) return wsResponse;

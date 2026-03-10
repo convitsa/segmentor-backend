@@ -11,6 +11,8 @@ import {
   CustomerEvent,
   Recording,
   RecordingChunk,
+  HeatmapEvent,
+  CobrowseSession,
 } from "../db/models.js";
 import { readFileSync, existsSync } from "fs";
 import { analyzeAndStore } from "../services/journeyAnalyzer.js";
@@ -188,6 +190,38 @@ const ingestEventSchema = z.discriminatedUnion("type", [
     seq: z.number(),
     ts: z.number(),
   }),
+  z.object({
+    type: z.literal("hm_click"),
+    url: z.string(),
+    properties: z.object({
+      x: z.number(),
+      y: z.number(),
+      vw: z.number(),
+      vh: z.number(),
+      sel: z.string().optional(),
+    }),
+    ts: z.number(),
+  }),
+  z.object({
+    type: z.literal("hm_move"),
+    url: z.string(),
+    properties: z.object({
+      points: z.array(z.object({ x: z.number(), y: z.number(), t: z.number() })),
+      vw: z.number(),
+      vh: z.number(),
+    }),
+    ts: z.number(),
+  }),
+  z.object({
+    type: z.literal("hm_scroll"),
+    url: z.string(),
+    properties: z.object({
+      depth: z.number(),
+      vw: z.number(),
+      vh: z.number(),
+    }),
+    ts: z.number(),
+  }),
 ]);
 
 const ingestBodySchema = z.object({
@@ -263,6 +297,7 @@ pub.post("/ingest", async (c) => {
     let lastPageUrl: string | null = null;
     let hasSessionEnd = false;
     const snapshotChunks: Array<{ d: Record<string, unknown>[]; seq: number }> = [];
+    const heatmapDocs: Array<Record<string, unknown>> = [];
 
     for (const evt of body.events) {
       const ts = new Date(evt.ts);
@@ -311,6 +346,32 @@ pub.post("/ingest", async (c) => {
         hasSessionEnd = true;
       } else if (evt.type === "s") {
         snapshotChunks.push({ d: evt.d, seq: evt.seq });
+      } else if (evt.type === "hm_click") {
+        const p = evt.properties;
+        heatmapDocs.push({
+          projectId: pid, sessionId: sid, url: evt.url, type: "click",
+          x: p.x, y: p.y, selector: p.sel || "",
+          viewportW: p.vw, viewportH: p.vh,
+          device: ctx.device || "desktop", timestamp: ts,
+        });
+      } else if (evt.type === "hm_move") {
+        const p = evt.properties;
+        for (const pt of p.points) {
+          heatmapDocs.push({
+            projectId: pid, sessionId: sid, url: evt.url, type: "move",
+            x: pt.x, y: pt.y,
+            viewportW: p.vw, viewportH: p.vh,
+            device: ctx.device || "desktop", timestamp: new Date(pt.t),
+          });
+        }
+      } else if (evt.type === "hm_scroll") {
+        const p = evt.properties;
+        heatmapDocs.push({
+          projectId: pid, sessionId: sid, url: evt.url, type: "scroll",
+          scrollDepth: p.depth,
+          viewportW: p.vw, viewportH: p.vh,
+          device: ctx.device || "desktop", timestamp: ts,
+        });
       }
     }
 
@@ -393,6 +454,21 @@ pub.post("/ingest", async (c) => {
     }
     if (impressions.length > 0) {
       ops.push(Event.insertMany(impressions));
+    }
+    if (heatmapDocs.length > 0) {
+      ops.push(HeatmapEvent.insertMany(heatmapDocs, { ordered: false }));
+
+      const hmCounts: Record<string, { clicks: number; moves: number; scrolls: number }> = {};
+      for (const d of heatmapDocs) {
+        const url = d.url as string;
+        if (!hmCounts[url]) hmCounts[url] = { clicks: 0, moves: 0, scrolls: 0 };
+        if (d.type === "click") hmCounts[url].clicks++;
+        else if (d.type === "move") hmCounts[url].moves++;
+        else if (d.type === "scroll") hmCounts[url].scrolls++;
+      }
+      for (const [url, counts] of Object.entries(hmCounts)) {
+        broadcast(pid, "heatmap:new", { url, ...counts });
+      }
     }
 
     // Handle pageview_end updates (update most recent matching pageview)
@@ -480,6 +556,15 @@ pub.post("/ingest", async (c) => {
           );
 
           await Promise.all(bgOps);
+
+          broadcast(pid, "recording:update", {
+            sessionId: sid,
+            visitorId: vid,
+            entryUrl: firstPageUrl || null,
+            device: ctx.device || null,
+            status: "recording",
+            chunkCount: bgSnapshotChunks.length,
+          });
         } catch (err) {
           console.error("Background snapshot store error:", err);
         }
@@ -546,6 +631,10 @@ pub.post("/ingest", async (c) => {
           visitorId: vid, sessionId: sid,
           timestamp: ts,
         });
+        broadcast(pid, "recording:end", {
+          sessionId: sid, visitorId: vid,
+          status: "complete", timestamp: ts,
+        });
       }
     }
 
@@ -578,11 +667,43 @@ pub.post("/ingest", async (c) => {
       });
     }
 
+    if (pvCount > 0 || evtCount > 0 || clickCount > 0) {
+      broadcast(pid, "analytics:activity", {
+        visitorId: vid,
+        sessionId: sid,
+        pageviews: pvCount,
+        events: evtCount,
+        clicks: clickCount,
+        timestamp: ts,
+      });
+    }
+
     return c.json({ ok: true });
   } catch (err) {
     console.error("Ingest error:", err);
     return c.json({ ok: false }, 500);
   }
+});
+
+pub.get("/cobrowse-check", async (c) => {
+  const projectKey = c.req.query("projectKey");
+  const sessionId = c.req.query("sessionId");
+  if (!projectKey || !sessionId) return c.json({ active: false });
+
+  const project = await Project.findOne({ publicKey: projectKey }).select("_id").lean();
+  if (!project) return c.json({ active: false });
+
+  const session = await CobrowseSession.findOne({
+    projectId: project._id,
+    sessionId,
+    status: { $in: ["requested", "active"] },
+  }).lean();
+
+  if (session && session.status === "requested") {
+    await CobrowseSession.updateOne({ _id: session._id }, { $set: { status: "active" } });
+  }
+
+  return c.json({ active: !!session });
 });
 
 pub.get("/project-config", async (c) => {
@@ -1134,6 +1255,69 @@ const PICKER_SCRIPT = `
 })();
 </script>
 `;
+
+pub.get("/heatmap-proxy", async (c) => {
+  const url = c.req.query("url");
+  if (!url || !isSafeUrl(url)) {
+    return c.text("Invalid URL", 400);
+  }
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; Segmentor/1.0)",
+        "Accept": "text/html",
+      },
+    });
+
+    if (!res.ok) {
+      return c.text(`Failed to fetch: ${res.status}`, 502);
+    }
+
+    let html = await res.text();
+
+    const parsed = new URL(url);
+    const siteBase = parsed.origin + parsed.pathname;
+    const base = siteBase.endsWith("/") ? siteBase : siteBase.substring(0, siteBase.lastIndexOf("/") + 1) || parsed.origin + "/";
+
+    html = html.replace(/<script[^>]*runtime\.js[^>]*><\/script>/gi, "");
+    html = html.replace(/<style[^>]*id=["']segmentor-hide["'][^>]*>[^<]*<\/style>/gi, "");
+
+    if (!html.includes("<base")) {
+      html = html.replace(/<head([^>]*)>/i, `<head$1><base href="${base}" target="_self" />`);
+    }
+
+    const injectedScripts = `<script>
+      document.addEventListener('click', function(e) {
+        var a = e.target.closest && e.target.closest('a');
+        if (a) { e.preventDefault(); e.stopPropagation(); }
+      }, true);
+      window.addEventListener('beforeunload', function(e) { e.preventDefault(); });
+      (function(){
+        function sendHeight(){
+          var h = Math.max(
+            document.body.scrollHeight||0, document.documentElement.scrollHeight||0,
+            document.body.offsetHeight||0, document.documentElement.offsetHeight||0
+          );
+          window.parent.postMessage({type:'segmentor-page-height',height:h},'*');
+        }
+        if(document.readyState==='complete') sendHeight();
+        else window.addEventListener('load',sendHeight);
+        new MutationObserver(sendHeight).observe(document.documentElement,{childList:true,subtree:true});
+        window.addEventListener('resize',sendHeight);
+      })();
+    </script>
+    <style>html,body{overflow:hidden!important;}</style>`;
+    html = html.replace("</head>", injectedScripts + "</head>");
+
+    c.header("Content-Type", "text/html; charset=utf-8");
+    c.header("X-Frame-Options", "ALLOWALL");
+    c.header("Content-Security-Policy", "");
+    return c.body(html);
+  } catch (err) {
+    return c.text(`Failed to fetch: ${err}`, 502);
+  }
+});
 
 pub.get("/proxy", async (c) => {
   const projectKey = c.req.query("projectKey");

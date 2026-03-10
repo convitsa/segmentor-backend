@@ -411,3 +411,53 @@ recordingChunkSchema.index(
   { expireAfterSeconds: 30 * 24 * 60 * 60 },
 );
 export const RecordingChunk = mongoose.model("RecordingChunk", recordingChunkSchema);
+
+// ─── HeatmapEvent ─────────────────────────────────────────────────────
+
+const heatmapEventSchema = new Schema(
+  {
+    projectId: { type: Schema.Types.ObjectId, required: true },
+    sessionId: String,
+    url: { type: String, required: true },
+    type: { type: String, required: true, enum: ["click", "move", "scroll"] },
+    x: Number,
+    y: Number,
+    scrollDepth: Number,
+    selector: String,
+    viewportW: Number,
+    viewportH: Number,
+    device: String,
+    timestamp: { type: Date, default: Date.now },
+  },
+  opts("HeatmapEvent"),
+);
+heatmapEventSchema.index({ projectId: 1, url: 1, type: 1, timestamp: -1 });
+heatmapEventSchema.index({ projectId: 1, url: 1 });
+heatmapEventSchema.index({ projectId: 1, url: 1, type: 1, sessionId: 1 });
+heatmapEventSchema.index(
+  { timestamp: 1 },
+  { expireAfterSeconds: 30 * 24 * 60 * 60 },
+);
+export const HeatmapEvent = mongoose.model("HeatmapEvent", heatmapEventSchema);
+
+// ─── CobrowseSession ─────────────────────────────────────────────────
+
+const cobrowseSessionSchema = new Schema(
+  {
+    projectId: { type: Schema.Types.ObjectId, required: true },
+    sessionId: { type: String, required: true },
+    visitorId: { type: String, required: true },
+    agentId: { type: Schema.Types.ObjectId },
+    status: { type: String, default: "requested", enum: ["requested", "active", "ended"] },
+    startedAt: { type: Date, default: Date.now },
+    endedAt: Date,
+  },
+  opts("CobrowseSession", true),
+);
+cobrowseSessionSchema.index({ projectId: 1, sessionId: 1 });
+cobrowseSessionSchema.index({ status: 1 });
+cobrowseSessionSchema.index(
+  { startedAt: 1 },
+  { expireAfterSeconds: 7 * 24 * 60 * 60 },
+);
+export const CobrowseSession = mongoose.model("CobrowseSession", cobrowseSessionSchema);
