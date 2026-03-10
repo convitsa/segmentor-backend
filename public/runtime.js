@@ -535,6 +535,7 @@
   var _CAP_MAX_BUF = 200;
   var _capEnabled = false;
   var _cbSentIdx = 0;
+  var _lastFullSnapshot = null;
 
   function startCapture() {
     if (_capStop) return;
@@ -542,6 +543,7 @@
     _capEnabled = true;
     _capStop = rrwebRecord({
       emit: function (event) {
+        if (event.type === 2) _lastFullSnapshot = event;
         _capBuf.push(event);
         if (_capBuf.length >= _CAP_MAX_BUF) {
           flushCapture();
@@ -666,12 +668,27 @@
   function cbStartStreaming() {
     if (_cbActive) return;
     _cbActive = true;
+    if (typeof rrwebRecord !== "undefined" && !_capStop) {
+      startCapture();
+    }
+    var initialEvents = [];
+    var snapshotInBuf = false;
+    for (var i = _capBuf.length - 1; i >= 0; i--) {
+      if (_capBuf[i] && _capBuf[i].type === 2) {
+        initialEvents = _capBuf.slice(i);
+        snapshotInBuf = true;
+        break;
+      }
+    }
+    if (!snapshotInBuf && _lastFullSnapshot) {
+      initialEvents = [_lastFullSnapshot].concat(_capBuf.slice(0));
+    }
     _cbSentIdx = _capBuf.length;
     if (_visWs && _visWs.readyState === 1) {
       _visWs.send(JSON.stringify({ type: "cb_visitor_ready" }));
-    }
-    if (typeof rrwebRecord !== "undefined" && !_capStop) {
-      startCapture();
+      if (initialEvents.length > 0) {
+        _visWs.send(JSON.stringify({ type: "cb_rrweb", events: initialEvents }));
+      }
     }
     if (!_cbStreamTimer) {
       _cbStreamTimer = setInterval(function () {
@@ -694,18 +711,22 @@
   function cbShowAgentCursor(msg) {
     if (!_cbAgentCursor) {
       _cbAgentCursor = document.createElement("div");
-      _cbAgentCursor.style.cssText = "position:fixed;width:20px;height:20px;border-radius:50%;background:rgba(99,102,241,0.7);pointer-events:none;z-index:999999;transition:all 0.1s ease;box-shadow:0 0 8px rgba(99,102,241,0.4);";
+      _cbAgentCursor.style.cssText = "position:fixed;pointer-events:none;z-index:999999;transition:left 0.1s ease,top 0.1s ease;";
+      _cbAgentCursor.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+        '<path d="M1 1L7 15L9.5 8.5L15 6L1 1Z" fill="#fa783e" stroke="#fa783e" stroke-width="1.2" stroke-linejoin="round"/>' +
+        '</svg>' +
+        '<div style="position:absolute;left:18px;top:12px;background:#fa783e;color:#fff;font-size:12px;font-family:Inter,system-ui,sans-serif;padding:2px 6px;border-radius:4px;white-space:nowrap;line-height:normal;">Agent</div>';
       document.body.appendChild(_cbAgentCursor);
     }
-    _cbAgentCursor.style.left = (msg.x * window.innerWidth - 10) + "px";
-    _cbAgentCursor.style.top = (msg.y * window.innerHeight - 10) + "px";
+    _cbAgentCursor.style.left = (msg.x * window.innerWidth) + "px";
+    _cbAgentCursor.style.top = (msg.y * window.innerHeight) + "px";
   }
 
   function cbShowHighlight(msg) {
     var el = msg.selector ? document.querySelector(msg.selector) : null;
     if (!el) return;
     var prev = el.style.outline;
-    el.style.outline = "3px solid rgba(99,102,241,0.8)";
+    el.style.outline = "3px solid rgba(250,120,62,0.8)";
     setTimeout(function () { el.style.outline = prev; }, 2000);
   }
 
